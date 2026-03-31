@@ -18,23 +18,23 @@
 
 ---
 
-## 🎥 Demo Video
+## Demo Video
 
 [![Demo Video](https://img.youtube.com/vi/VS3vQp5i8YQ/0.jpg)](https://youtu.be/VS3vQp5i8YQ)
 
 > *True protocol portability: Cocoa-Way rendering Linux apps from OrbStack via Unix sockets.*
 
-## ✨ Features
+## Features
 
-| Feature | Description |
-|---------|-------------|
-| 🍎 **Native macOS** | Metal/OpenGL rendering, seamless desktop integration |
-| 🚀 **Zero VM Overhead** | Direct Wayland protocol via socket, no virtualization |
-| 📺 **HiDPI Ready** | Optimized for Retina displays with proper scaling |
-| 🎨 **Polished UI** | Server-side decorations with shadows and focus indicators |
-| ⚡ **Hardware Accelerated** | Efficient OpenGL rendering pipeline |
+| Feature                               | Description                                               |
+| ------------------------------------- | --------------------------------------------------------- |
+| **Native macOS**                | Metal rendering                                           |
+| **Compositor Zero VM Overhead** | Direct Wayland protocol via socket, no virtualization     |
+| **HiDPI Ready**                 | Optimized for Retina displays with proper scaling         |
+| **Polished UI**                 | Server-side decorations with shadows and focus indicators |
+| **Hardware Accelerated**        | Efficient Metal rendering pipeline                       |
 
-## 📦 Installation
+## Installation
 
 ### Homebrew (Recommended)
 
@@ -59,24 +59,26 @@ cd cocoa-way
 cargo build --release
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 > ⚠️ **Required:** You must install [waypipe-darwin](https://github.com/J-x-Z/waypipe-darwin) to connect Linux apps.
+>
 > ```bash
 > brew tap J-x-Z/tap && brew install waypipe-darwin
 > ```
 
 1. **Start the compositor:**
+
    ```bash
    cocoa-way
    ```
-
 2. **Connect Linux apps via SSH:**
+
    ```bash
    ./run_waypipe.sh ssh user@linux-host firefox
    ```
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph LR
@@ -84,42 +86,38 @@ graph LR
         CW[Cocoa-Way<br/>Compositor]
         WP1[waypipe<br/>client]
     end
-    
+  
     subgraph Linux VM/Container
         WP2[waypipe<br/>server]
         APP[Linux App<br/>Firefox, etc]
     end
-    
+  
     APP -->|Wayland Protocol| WP2
     WP2 <-->|SSH/Socket| WP1
     WP1 -->|Wayland Protocol| CW
-    CW -->|Metal/OpenGL| Display[macOS Display]
+    CW -->|Metal| Display[macOS Display]
 ```
 
-## 🆚 Comparison
+## Comparison
 
-| Solution | Latency | HiDPI | Native Integration | Setup Complexity |
-|----------|---------|-------|--------------------|------------------|
-| **Cocoa-Way** | ⚡ Low | ✅ | ✅ Native windows | 🟢 Easy |
-| XQuartz | 🐢 High | ⚠️ Partial | ⚠️ X11 quirks | 🟡 Medium |
-| VNC | 🐢 High | ❌ | ❌ Full screen | 🟡 Medium |
-| VM GUI | 🐢 High | ⚠️ Partial | ❌ Separate window | 🔴 Complex |
+| Solution            | Latency | HiDPI        | Native Integration | Setup Complexity |
+| ------------------- | ------- | ------------ | ------------------ | ---------------- |
+| **Cocoa-Way** | ⚡ Low  | ✅           | ✅ Native windows  | 🟢 Easy          |
+| XQuartz             | 🐢 High | ⚠️ Partial | ⚠️ X11 quirks    | 🟡 Medium        |
+| VNC                 | 🐢 High | ❌           | ❌ Full screen     | 🟡 Medium        |
+| VM GUI              | 🐢 High | ⚠️ Partial | ❌ Separate window | 🔴 Complex       |
 
-## 🗺️ Roadmap
+## Roadmap
 
-- [x] macOS backend (Metal/OpenGL)
-- [x] Waypipe integration
-- [x] HiDPI scaling
+- [X] macOS backend (METAL)
+- [X] Waypipe integration
+- [X] HiDPI scaling
 - [ ] 🚧 Windows backend ([win-way](https://github.com/J-x-Z/win-way))
 - [ ] 📱 Android NDK backend (planned)
 - [ ] Multi-monitor support
 - [ ] Clipboard sync
 
-## 📚 Research
-
-This project is part of the **"Turbo-Charged Protocol Virtualization"** research initiative exploring zero-cost cross-platform Wayland via Rust trait monomorphization + SIMD-accelerated pixel conversion.
-
-## ❓ Troubleshooting
+## Troubleshooting
 
 <details>
 <summary><b>SSH: "remote port forwarding failed"</b></summary>
@@ -127,15 +125,17 @@ This project is part of the **"Turbo-Charged Protocol Virtualization"** research
 A stale socket file exists on the remote host. Our `run_waypipe.sh` script handles this automatically with `-o StreamLocalBindUnlink=yes`.
 
 If running manually:
+
 ```bash
 waypipe ssh -o StreamLocalBindUnlink=yes user@host ...
 ```
+
 </details>
 
-## 🤝 Contributing
+## Contributing
 
 Contributions welcome! Please open an issue first to discuss major changes.
 
-## 📄 License
+## License
 
 [GPL-3.0](LICENSE) - Copyright (c) 2024-2025 J-x-Z

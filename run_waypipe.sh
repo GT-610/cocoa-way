@@ -17,7 +17,7 @@ if [ "$1" = "ssh" ]; then
     echo "Info: Detected SSH mode. Injecting '-o StreamLocalBindUnlink=yes' to fix socket conflicts."
     # Insert the option after 'ssh'
     shift
-    exec waypipe ssh -o StreamLocalBindUnlink=yes "$@"
+    exec waypipe --compress=zstd ssh -o StreamLocalBindUnlink=yes "$@"
 else
     # Execute waypipe with the provided arguments
     exec waypipe "$@"

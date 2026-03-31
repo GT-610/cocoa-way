@@ -55,8 +55,8 @@ impl Layout {
             tiles: Vec::new(),
             focused_idx: None,
             view_size: Size::from((width, height)),
-            gap: 10,
-            padding: 10,
+            gap: 0,
+            padding: 0,
         }
     }
     pub fn set_view_size(&mut self, width: i32, height: i32) {
@@ -128,6 +128,11 @@ impl Layout {
     }
     pub fn tile_for_surface(&self, surface_id: &ObjectId) -> Option<&Tile> {
         self.tiles.iter().find(|t| &t.surface_id() == surface_id)
+    }
+    pub fn move_tile(&mut self, surface_id: &ObjectId, x: i32, y: i32) {
+        if let Some(tile) = self.tiles.iter_mut().find(|t| &t.surface_id() == surface_id) {
+            tile.position = Point::from((x, y));
+        }
     }
     pub fn focus_next(&mut self) {
         if let Some(idx) = self.focused_idx {

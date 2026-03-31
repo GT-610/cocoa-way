@@ -1,7 +1,7 @@
 class CocoaWay < Formula
   desc "Native macOS Wayland compositor for running Linux apps"
   homepage "https://github.com/J-x-Z/cocoa-way"
-  url "https://github.com/J-x-Z/cocoa-way.git", tag: "v0.2.0"
+  url "https://github.com/J-x-Z/cocoa-way.git", tag: "v1.0.0"
   license "GPL-3.0-only"
   head "https://github.com/J-x-Z/cocoa-way.git", branch: "main"
 
