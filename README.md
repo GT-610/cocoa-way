@@ -112,10 +112,9 @@ graph LR
 - [X] macOS backend (METAL)
 - [X] Waypipe integration
 - [X] HiDPI scaling
-- [ ] 🚧 Windows backend ([win-way](https://github.com/J-x-Z/win-way))
-- [ ] 📱 Android NDK backend (planned)
+- [ ] winit and objc update
 - [ ] Multi-monitor support
-- [ ] Clipboard sync
+- [X] Clipboard sync
 
 ## Troubleshooting
 
