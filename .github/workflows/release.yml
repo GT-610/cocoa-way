@@ -33,6 +33,7 @@ jobs:
           APP_DIR="${APP_NAME}.app"
           VERSION="${GITHUB_REF_NAME#v}"
           mkdir -p "${APP_DIR}/Contents/MacOS"
+          mkdir -p "${APP_DIR}/Contents/Frameworks"
           mkdir -p "${APP_DIR}/Contents/Resources"
           
           cp target/release/cocoa-way "${APP_DIR}/Contents/MacOS/"
@@ -70,6 +71,15 @@ jobs:
           PLIST
           sed -i '' "s/VERSION_PLACEHOLDER/${VERSION}/g" "${APP_DIR}/Contents/Info.plist"
 
+      - name: Bundle runtime dylibs
+        run: |
+          chmod +x ./scripts/bundle-macos-app.sh
+          ./scripts/bundle-macos-app.sh Cocoa-Way.app
+
+      - name: Verify bundled dylibs
+        run: |
+          ! otool -L Cocoa-Way.app/Contents/MacOS/cocoa-way | grep -E '/(opt/homebrew|usr/local|nix)/'
+
       - name: Create ZIP archive
         run: |
           zip -r "Cocoa-Way-${{ github.ref_name }}-arm64-macos.zip" Cocoa-Way.app
@@ -96,4 +106,3 @@ jobs:
 
     outputs:
       sha256: ${{ steps.sha.outputs.sha256 }}
-
