@@ -3,4 +3,5 @@ pub enum CompositorMessage {
     Fullscreen(bool),
     ToggleHiDpi,
     Connect(usize),
+    StartContainerSession(usize),
 }

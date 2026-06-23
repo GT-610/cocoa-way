@@ -78,28 +78,28 @@ cargo build --release
    ./run_waypipe.sh ssh user@linux-host firefox
    ```
 
-3. **Or add persistent connections in `~/.config/cocoa-way/connections.toml`:**
+3. **Or add persistent container sessions in `~/.config/cocoa-way/container-sessions.toml`:**
 
    ```toml
-   [[connection]]
+   [[session]]
    name = "Ubuntu (Apple Container)"
-   type = "container"
-   container_runtime = "container"
+   runtime = "container"
    image = "docker.io/library/ubuntu:24.04"
+   profile = "single-app"
    app = "weston-terminal"
    container_socket = "/tmp/cocoa-way/waypipe.sock"
    runtime_args = ["--rosetta"]
    ```
 
-   Then use the menu bar inside Cocoa-Way to launch the connection.
+   Then use the Container menu inside Cocoa-Way to launch the session.
 
 ### Container Runtimes
 
-Cocoa-Way can now launch local container-backed apps through connection entries with `type = "container"`.
+Cocoa-Way has two control modes: Classic connections for SSH / local sockets, and Container Mode for local Linux GUI sessions managed by Cocoa-Way.
 
-- `container_runtime = "container"` uses Apple's official [`container`](https://github.com/apple/container) CLI. Apple documents it as requiring Apple silicon and macOS 26+, and you must start its background service first with `container system start`.
-- `container_runtime = "docker"` works with Docker Desktop and compatible CLIs.
-- `container_runtime = "orb"` or `container_runtime = "orbstack"` works with OrbStack.
+- `runtime = "container"` uses Apple's official [`container`](https://github.com/apple/container) CLI. Apple documents it as requiring Apple silicon and macOS 26+, and you must start its background service first with `container system start`.
+- `runtime = "docker"` works with Docker Desktop and compatible CLIs.
+- `runtime = "orb"` or `runtime = "orbstack"` works with OrbStack.
 
 For Apple Container, Cocoa-Way uses `container run --publish-socket ...` so the waypipe socket is exported back to macOS without requiring a shared bind mount. For Docker and OrbStack, Cocoa-Way bind-mounts the host socket directory into the container and connects over that local socket.
 

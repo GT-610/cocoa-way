@@ -14,7 +14,9 @@ mod render;
 mod state;
 mod metal_renderer;
 mod connections;
+mod container_sessions;
 mod menu_bar;
+mod runtime_paths;
 
 use messages::CompositorMessage;
 use crate::state::AppState;
@@ -106,6 +108,7 @@ fn main() {
 
     // Will be installed in Event::Resumed (after winit's applicationDidFinishLaunching)
     let connections_for_menu = connections::load_connections();
+    let container_sessions_for_menu = container_sessions::load_sessions();
     let mut pending_menu: Option<std::sync::mpsc::Sender<CompositorMessage>> = Some(menu_signal);
 
     let mut last_mouse_pos =
@@ -164,6 +167,14 @@ fn main() {
                         let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
                         let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
                         connections::spawn_waypipe(conn, &rt, &disp);
+                    }
+                }
+                CompositorMessage::StartContainerSession(i) => {
+                    log::info!("Starting container session #{}", i);
+                    if let Some(session) = container_sessions::load_sessions().get(i) {
+                        let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+                        let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+                        container_sessions::spawn_session(session, &rt, &disp);
                     }
                 }
             }
@@ -618,7 +629,12 @@ fn main() {
                 if let Some(sender) = pending_menu.take() {
                     // SAFETY: Resumed always fires on the main thread
                     let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
-                    menu_bar::setup_menu(&connections_for_menu, sender, mtm);
+                    menu_bar::setup_menu(
+                        &connections_for_menu,
+                        &container_sessions_for_menu,
+                        sender,
+                        mtm,
+                    );
                     // Disable macOS tab bar via NSView -> NSWindow
                     {
                         use raw_window_handle::{HasWindowHandle, RawWindowHandle};

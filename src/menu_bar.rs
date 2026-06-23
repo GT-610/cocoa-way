@@ -8,18 +8,19 @@
 //!   - separator
 //!   - saved connections from ~/.config/cocoa-way/connections.toml
 
-use std::sync::Mutex;
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 
 use objc2::declare_class;
 use objc2::mutability::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{ClassType, DeclaredClass, msg_send, msg_send_id, sel};
+use objc2::{msg_send, msg_send_id, sel, ClassType, DeclaredClass};
 use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
 use objc2_foundation::{MainThreadMarker, NSRect, NSString};
 
 use crate::connections::Connection;
+use crate::container_sessions::{self, ContainerSession};
 use crate::messages::CompositorMessage;
 
 // ── Global channel sender ─────────────────────────────────────────────────────
@@ -59,6 +60,17 @@ declare_class!(
         fn connect_machine(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             send(CompositorMessage::Connect(tag as usize));
+        }
+
+        #[method(openContainerMode:)]
+        fn open_container_mode(&self, _sender: &AnyObject) {
+            unsafe { show_container_mode_dialog(); }
+        }
+
+        #[method(startContainerSession:)]
+        fn start_container_session(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            send(CompositorMessage::StartContainerSession(tag as usize));
         }
 
         /// Toggles HiDPI rendering.
@@ -196,16 +208,45 @@ unsafe fn show_quick_connect_dialog() {
                     Some(pass_str)
                 },
                 waypipe_path: None,
-                image: None,
-                container_runtime: None,
-                container_socket: None,
-                runtime_args: vec![],
             };
             let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
             let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
             crate::connections::spawn_waypipe(&conn, &rt, &disp);
         }
     }
+}
+
+unsafe fn show_container_mode_dialog() {
+    use objc2_app_kit::NSAlert;
+
+    let sessions = container_sessions::load_sessions();
+    let config_path = container_sessions::config_path();
+    let details = if sessions.is_empty() {
+        format!(
+            "No container sessions are configured yet.\n\nEdit:\n{}",
+            config_path.display()
+        )
+    } else {
+        let names = sessions
+            .iter()
+            .map(|session| format!("• {}", session.name))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "Configured sessions:\n{}\n\nEdit:\n{}",
+            names,
+            config_path.display()
+        )
+    };
+
+    let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
+    let _: () = msg_send![&*alert, setMessageText:
+        &*NSString::from_str("Container Mode")];
+    let _: () = msg_send![&*alert, setInformativeText:
+        &*NSString::from_str(&details)];
+    let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+        &*NSString::from_str("OK")];
+    let _: isize = msg_send![&*alert, runModal];
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
@@ -225,6 +266,7 @@ unsafe fn label_item(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem>
 /// Must be called on the main thread after winit's `applicationDidFinishLaunching`.
 pub fn setup_menu(
     connections: &[Connection],
+    container_sessions: &[ContainerSession],
     sender: Sender<CompositorMessage>,
     mtm: MainThreadMarker,
 ) {
@@ -286,7 +328,43 @@ pub fn setup_menu(
         conn_item.setSubmenu(Some(&conn_menu));
         root.addItem(&conn_item);
 
-        // ── 3. View menu ──────────────────────────────────────────────────────
+        // ── 3. Container menu ─────────────────────────────────────────────────
+        let container_item = label_item("Container", mtm);
+        let container_menu =
+            NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("Container"));
+
+        let open_container = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str("Open Container Mode…"),
+            Some(sel!(openContainerMode:)),
+            &NSString::from_str(""),
+        );
+        let _: () = msg_send![&*open_container, setTarget: &*handler];
+        container_menu.addItem(&open_container);
+        container_menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        if container_sessions.is_empty() {
+            let ph = label_item("No container sessions configured", mtm);
+            let _: () = msg_send![&*ph, setEnabled: false];
+            container_menu.addItem(&ph);
+        } else {
+            for (i, session) in container_sessions.iter().enumerate() {
+                let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                    mtm.alloc::<NSMenuItem>(),
+                    &NSString::from_str(&session.name),
+                    Some(sel!(startContainerSession:)),
+                    &NSString::from_str(""),
+                );
+                let _: () = msg_send![&*item, setTag: i as isize];
+                let _: () = msg_send![&*item, setTarget: &*handler];
+                container_menu.addItem(&item);
+            }
+        }
+
+        container_item.setSubmenu(Some(&container_menu));
+        root.addItem(&container_item);
+
+        // ── 4. View menu ──────────────────────────────────────────────────────
         let view_item = label_item("View", mtm);
         let view_menu = NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("View"));
         let hidpi = NSMenuItem::initWithTitle_action_keyEquivalent(
