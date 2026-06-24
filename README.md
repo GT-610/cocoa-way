@@ -141,7 +141,7 @@ graph LR
 - [ ] Multi-monitor support
 - [X] Clipboard sync
 
-##next step
+## next step
 new gui
 <img width="1164" height="779" alt="image" src="https://github.com/user-attachments/assets/f4c854eb-d828-4a09-baa6-aeed7f02e108" />
 1.1.0 soon
