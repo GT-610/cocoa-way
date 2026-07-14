@@ -9,7 +9,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorHandler, CompositorState},
         selection::data_device::{DataDeviceHandler, WaylandDndGrabHandler},
         selection::SelectionHandler,
-        shm::{BufferData, ShmHandler, ShmState},
+        shm::{ShmHandler, ShmState},
     },
 };
 use smithay::wayland::shell::xdg::{XdgShellHandler, XdgShellState};
@@ -17,18 +17,20 @@ use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecoration
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
 pub struct AppState {
+    display_handle: DisplayHandle,
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
     pub seat_state: SeatState<AppState>,
     pub seat: Seat<Self>,
     pub data_device_state: smithay::wayland::selection::data_device::DataDeviceState,
-    pub xdg_decoration_state: XdgDecorationState,
-    pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
-    pub fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
-    pub pointer_constraints_state: smithay::wayland::pointer_constraints::PointerConstraintsState,
-    pub relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
-    pub output_state: smithay::wayland::output::OutputManagerState,
+    pub data_control_state: smithay::wayland::selection::wlr_data_control::DataControlState,
+    _xdg_decoration_state: XdgDecorationState,
+    _viewporter_state: smithay::wayland::viewporter::ViewporterState,
+    _fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    _pointer_constraints_state: smithay::wayland::pointer_constraints::PointerConstraintsState,
+    _relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
+    _output_state: smithay::wayland::output::OutputManagerState,
     pub output: smithay::output::Output,
     pub toplevels: Vec<smithay::wayland::shell::xdg::ToplevelSurface>,
     pub popups: Vec<smithay::wayland::shell::xdg::PopupSurface>,
@@ -49,7 +51,18 @@ pub struct AppState {
     /// Monotonic start time — used to compute frame timestamps for wl_callback::done.
     pub start_time: std::time::Instant,
     /// Frame callbacks collected during commit(); fired after swap_buffers().
-    pub pending_frame_callbacks: Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback>,
+    pub pending_frame_callbacks:
+        Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback>,
+    /// Set by Wayland commits or layout changes so the winit loop can avoid
+    /// continuous redraws when the scene is idle.
+    pub needs_redraw: bool,
+    /// Total Wayland surface commits observed since startup. Used for lightweight
+    /// performance diagnostics in Container Mode.
+    pub commit_counter: u64,
+    host_clipboard_text: Option<String>,
+    pending_guest_clipboard_mime: Option<String>,
+    pasteboard_change_count: isize,
+    last_pasteboard_poll: std::time::Instant,
 }
 impl AppState {
     pub fn new(
@@ -66,6 +79,12 @@ impl AppState {
             vec![
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Abgr8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xbgr8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Rgba8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Rgbx8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Bgra8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Bgrx8888,
             ],
         );
         let mut seat_state = SeatState::new();
@@ -83,7 +102,7 @@ impl AppState {
             display_handle,
         );
         let output = smithay::output::Output::new(
-            "winit".to_string(),  
+            "winit".to_string(),
             smithay::output::PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: smithay::output::Subpixel::Unknown,
@@ -106,22 +125,46 @@ impl AppState {
         );
         output.set_preferred(mode);
         Self {
+            display_handle: display_handle.clone(),
             compositor_state,
             xdg_shell_state,
             shm_state,
             seat_state,
             seat,
-            data_device_state: smithay::wayland::selection::data_device::DataDeviceState::new::<Self>(display_handle),
-            xdg_decoration_state: XdgDecorationState::new::<Self>(display_handle),
-            viewporter_state: smithay::wayland::viewporter::ViewporterState::new::<Self>(display_handle),
-            fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<Self>(display_handle),
-            pointer_constraints_state: smithay::wayland::pointer_constraints::PointerConstraintsState::new::<Self>(display_handle),
-            relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState::new::<Self>(display_handle),
-            output_state,
+            data_device_state: smithay::wayland::selection::data_device::DataDeviceState::new::<Self>(
+                display_handle,
+            ),
+            data_control_state:
+                smithay::wayland::selection::wlr_data_control::DataControlState::new::<Self, _>(
+                    display_handle,
+                    None,
+                    |_| true,
+                ),
+            _xdg_decoration_state: XdgDecorationState::new::<Self>(display_handle),
+            _viewporter_state: smithay::wayland::viewporter::ViewporterState::new::<Self>(
+                display_handle,
+            ),
+            _fractional_scale_state:
+                smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<Self>(
+                    display_handle,
+                ),
+            _pointer_constraints_state:
+                smithay::wayland::pointer_constraints::PointerConstraintsState::new::<Self>(
+                    display_handle,
+                ),
+            _relative_pointer_state:
+                smithay::wayland::relative_pointer::RelativePointerManagerState::new::<Self>(
+                    display_handle,
+                ),
+            _output_state: output_state,
             output,
             toplevels: Vec::new(),
             popups: Vec::new(),
-            layout: Layout::new((width as f64 / scale_factor) as i32, (height as f64 / scale_factor) as i32),
+            layout: {
+                let (logical_width, logical_height) =
+                    crate::layout::logical_size_from_physical(width, height, scale_factor);
+                Layout::new(logical_width, logical_height)
+            },
             surface_positions: std::collections::HashMap::new(),
             drag_state: None,
             start_drag_request: None,
@@ -131,14 +174,135 @@ impl AppState {
             scale_factor,
             start_time: std::time::Instant::now(),
             pending_frame_callbacks: Vec::new(),
+            needs_redraw: true,
+            commit_counter: 0,
+            host_clipboard_text: None,
+            pending_guest_clipboard_mime: None,
+            pasteboard_change_count: -1,
+            last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
         }
     }
+
+    pub fn poll_host_clipboard(&mut self) {
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_pasteboard_poll) < std::time::Duration::from_millis(100) {
+            return;
+        }
+        self.last_pasteboard_poll = now;
+
+        let (change_count, text) = pasteboard_snapshot();
+        if change_count == self.pasteboard_change_count {
+            return;
+        }
+        self.pasteboard_change_count = change_count;
+        let Some(text) = text else {
+            self.host_clipboard_text = None;
+            crate::diagnostics::record_clipboard_host_change(0);
+            return;
+        };
+        if self.host_clipboard_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+
+        self.host_clipboard_text = Some(text);
+        crate::diagnostics::record_clipboard_host_change(
+            self.host_clipboard_text.as_ref().map_or(0, String::len),
+        );
+        log::info!("Clipboard: publishing changed macOS text to Wayland clients");
+        smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
+            &self.display_handle,
+            &self.seat,
+            clipboard_text_mime_types(),
+            (),
+        );
+    }
+
+    pub fn install_guest_clipboard(&mut self, text: String) {
+        if self.host_clipboard_text.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        self.pasteboard_change_count = write_to_pasteboard(&text);
+        crate::diagnostics::record_clipboard_guest_install(text.len());
+        self.host_clipboard_text = Some(text);
+        log::info!("Clipboard: installed Wayland text on the macOS pasteboard");
+        smithay::wayland::selection::data_device::set_data_device_selection::<Self>(
+            &self.display_handle,
+            &self.seat,
+            clipboard_text_mime_types(),
+            (),
+        );
+    }
+
+    /// Read a client selection only after Smithay has committed it to the seat.
+    /// `SelectionHandler::new_selection` runs before that protocol state update.
+    pub fn request_pending_guest_clipboard(&mut self) {
+        let Some(mime) = self.pending_guest_clipboard_mime.take() else {
+            return;
+        };
+        let (read_fd, write_fd) = match nix_pipe() {
+            Some(pair) => pair,
+            None => {
+                crate::diagnostics::record_clipboard_failure(
+                    "Unable to create a pipe for the Wayland clipboard transfer",
+                );
+                return;
+            }
+        };
+        if let Err(error) =
+            smithay::wayland::selection::data_device::request_data_device_client_selection::<AppState>(
+                &self.seat,
+                mime.clone(),
+                write_fd,
+            )
+        {
+            log::warn!("Failed to request Wayland clipboard contents as {mime}: {error}");
+            crate::diagnostics::record_clipboard_failure(format!(
+                "Failed to request Wayland clipboard contents as {mime}: {error}"
+            ));
+            return;
+        }
+
+        let loop_signal = self.loop_signal.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut file = std::fs::File::from(read_fd);
+            let mut text = String::new();
+            match file.read_to_string(&mut text) {
+                Ok(_) if !text.is_empty() => {
+                    let _ = loop_signal
+                        .send(crate::messages::CompositorMessage::GuestClipboardText(text));
+                }
+                Ok(_) => crate::diagnostics::record_clipboard_failure(
+                    "Wayland clipboard offer returned no text",
+                ),
+                Err(error) => crate::diagnostics::record_clipboard_failure(format!(
+                    "Failed to read the Wayland clipboard offer: {error}"
+                )),
+            }
+        });
+    }
     pub fn update_scale_factor(&mut self, scale: f64) {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            log::warn!("Ignoring invalid window scale factor: {}", scale);
+            1.0
+        };
+        self.scale_factor = scale;
         self.output.change_current_state(
-            None, None,
-            Some(smithay::output::Scale::Integer(scale.round() as i32)),
+            None,
+            None,
+            Some(smithay::output::Scale::Integer(
+                (scale.round() as i32).clamp(1, 8),
+            )),
             None,
         );
+        let (logical_width, logical_height) =
+            crate::layout::logical_size_from_physical(self.width, self.height, scale);
+        self.layout.set_view_size(logical_width, logical_height);
+        for tile in &self.layout.tiles {
+            tile.request_size();
+        }
     }
 }
 impl smithay::wayland::output::OutputHandler for AppState {}
@@ -161,7 +325,9 @@ impl CompositorHandler for AppState {
         // No-op: pre-commit hook logging removed to avoid 60fps log spam
     }
     fn commit(&mut self, surface: &WlSurface) {
-        use smithay::wayland::compositor::{SurfaceAttributes, with_surface_tree_downward, TraversalAction};
+        use smithay::wayland::compositor::{
+            SurfaceAttributes, TraversalAction, with_surface_tree_downward,
+        };
         let mut new_cbs = Vec::new();
         with_surface_tree_downward(
             surface,
@@ -174,6 +340,35 @@ impl CompositorHandler for AppState {
             |_, _, _| true,
         );
         self.pending_frame_callbacks.extend(new_cbs);
+        self.commit_counter = self.commit_counter.saturating_add(1);
+        self.needs_redraw = true;
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
+        let surface_id = surface.id();
+        self.layout.remove_tile(&surface_id);
+        self.toplevels
+            .retain(|toplevel| toplevel.wl_surface() != surface);
+        self.popups.retain(|popup| popup.wl_surface() != surface);
+        self.surface_positions.remove(&surface_id);
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|(id, _)| id == &surface_id)
+        {
+            self.drag_state = None;
+        }
+        if self.start_drag_request.as_ref() == Some(&surface_id) {
+            self.start_drag_request = None;
+        }
+
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            if keyboard.current_focus().as_ref() == Some(surface) {
+                keyboard.set_focus(self, None, smithay::utils::SERIAL_COUNTER.next_serial());
+            }
+        }
+        self.needs_redraw = true;
+        log::info!("Removed destroyed surface {surface_id:?} from the compositor layout");
     }
 }
 impl XdgShellHandler for AppState {
@@ -185,12 +380,12 @@ impl XdgShellHandler for AppState {
         if !self.toplevels.contains(&surface) {
             self.toplevels.push(surface.clone());
             self.layout.add_tile(surface.clone());
+            self.needs_redraw = true;
         }
-        let scale_int = self.scale_factor.round() as i32;
         // Tell the client the compositor window size and scale so it renders at
         // the correct HiDPI resolution.
-        let logical_w = (self.width as f64 / self.scale_factor).round() as i32;
-        let logical_h = (self.height as f64 / self.scale_factor).round() as i32;
+        let (logical_w, logical_h) =
+            crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
         surface.with_pending_state(|state| {
             state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
             state.size = Some((logical_w, logical_h).into());
@@ -217,6 +412,7 @@ impl XdgShellHandler for AppState {
             return;
         }
         self.popups.push(surface);
+        self.needs_redraw = true;
     }
     fn grab(
         &mut self,
@@ -241,8 +437,8 @@ impl XdgShellHandler for AppState {
             self.height,
             self.scale_factor
         );
-        let logical_w = (self.width as f64 / self.scale_factor) as i32;
-        let logical_h = (self.height as f64 / self.scale_factor) as i32;
+        let (logical_w, logical_h) =
+            crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
         log::info!(
             "Maximizing to Logical Size: {}x{} (Physical: {}x{}, Scale: {})",
             logical_w,
@@ -276,8 +472,8 @@ impl XdgShellHandler for AppState {
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
         log::info!("Fullscreen Request: {:?}", surface.wl_surface().id());
-        let logical_w = (self.width as f64 / self.scale_factor) as i32;
-        let logical_h = (self.height as f64 / self.scale_factor) as i32;
+        let (logical_w, logical_h) =
+            crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
         log::info!("Fullscreening to Logical Size: {}x{}", logical_w, logical_h);
         surface.with_pending_state(|state| {
              state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
@@ -318,8 +514,7 @@ impl ShmHandler for AppState {
     }
 }
 impl BufferHandler for AppState {
-    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {
-    }
+    fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 impl SeatHandler for AppState {
     type KeyboardFocus = WlSurface;
@@ -329,8 +524,8 @@ impl SeatHandler for AppState {
         &mut self.seat_state
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        use smithay::input::pointer::CursorIcon;
         use objc2_app_kit::NSCursor;
+        use smithay::input::pointer::CursorIcon;
         unsafe {
             match image {
                 CursorImageStatus::Hidden => NSCursor::hide(),
@@ -342,11 +537,23 @@ impl SeatHandler for AppState {
                         CursorIcon::Grab => NSCursor::openHandCursor(),
                         CursorIcon::Grabbing => NSCursor::closedHandCursor(),
                         CursorIcon::Crosshair => NSCursor::crosshairCursor(),
-                        CursorIcon::NotAllowed | CursorIcon::NoDrop => NSCursor::operationNotAllowedCursor(),
-                        CursorIcon::EResize | CursorIcon::WResize | CursorIcon::EwResize | CursorIcon::ColResize => NSCursor::resizeLeftRightCursor(),
-                        CursorIcon::NResize | CursorIcon::SResize | CursorIcon::NsResize | CursorIcon::RowResize => NSCursor::resizeUpDownCursor(),
-                        CursorIcon::NeResize | CursorIcon::SwResize | CursorIcon::NeswResize => NSCursor::resizeLeftRightCursor(),
-                        CursorIcon::NwResize | CursorIcon::SeResize | CursorIcon::NwseResize => NSCursor::resizeLeftRightCursor(),
+                        CursorIcon::NotAllowed | CursorIcon::NoDrop => {
+                            NSCursor::operationNotAllowedCursor()
+                        }
+                        CursorIcon::EResize
+                        | CursorIcon::WResize
+                        | CursorIcon::EwResize
+                        | CursorIcon::ColResize => NSCursor::resizeLeftRightCursor(),
+                        CursorIcon::NResize
+                        | CursorIcon::SResize
+                        | CursorIcon::NsResize
+                        | CursorIcon::RowResize => NSCursor::resizeUpDownCursor(),
+                        CursorIcon::NeResize | CursorIcon::SwResize | CursorIcon::NeswResize => {
+                            NSCursor::resizeLeftRightCursor()
+                        }
+                        CursorIcon::NwResize | CursorIcon::SeResize | CursorIcon::NwseResize => {
+                            NSCursor::resizeLeftRightCursor()
+                        }
                         CursorIcon::Copy => NSCursor::dragCopyCursor(),
                         CursorIcon::Alias => NSCursor::dragLinkCursor(),
                         CursorIcon::ContextMenu => NSCursor::contextualMenuCursor(),
@@ -362,7 +569,14 @@ impl SeatHandler for AppState {
             }
         }
     }
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focus: Option<&Self::KeyboardFocus>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focus: Option<&Self::KeyboardFocus>) {
+        let client = focus.and_then(Resource::client);
+        smithay::wayland::selection::data_device::set_data_device_focus::<Self>(
+            &self.display_handle,
+            seat,
+            client,
+        );
+    }
 }
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
@@ -377,7 +591,7 @@ impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
     }
 }
 use smithay::wayland::selection::data_device::DataDeviceState;
-use smithay::wayland::selection::{SelectionTarget, SelectionSource};
+use smithay::wayland::selection::{SelectionSource, SelectionTarget};
 impl SelectionHandler for AppState {
     type SelectionUserData = ();
 
@@ -385,39 +599,26 @@ impl SelectionHandler for AppState {
         &mut self,
         ty: SelectionTarget,
         source: Option<SelectionSource>,
-        seat: smithay::input::Seat<Self>,
+        _seat: smithay::input::Seat<Self>,
     ) {
         if ty != SelectionTarget::Clipboard {
             return;
         }
         let source = match source {
             Some(s) => s,
-            None => return,
+            None => {
+                self.pending_guest_clipboard_mime = None;
+                return;
+            }
         };
-        let mime = if source.mime_types().iter().any(|m| m == "text/plain;charset=utf-8") {
-            "text/plain;charset=utf-8".to_string()
-        } else if source.mime_types().iter().any(|m| m == "text/plain") {
-            "text/plain".to_string()
-        } else {
+        let mime_types = source.mime_types();
+        let Some(mime) = preferred_clipboard_text_mime(&mime_types) else {
+            self.pending_guest_clipboard_mime = None;
             return;
         };
-        let (read_fd, write_fd) = match nix_pipe() {
-            Some(pair) => pair,
-            None => return,
-        };
-        // Ask the client to write its selection data to the write end of the pipe.
-        let _ = smithay::wayland::selection::data_device::request_data_device_client_selection::<AppState>(
-            &seat, mime, write_fd,
-        );
-        std::thread::spawn(move || {
-            use std::io::Read;
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
-            let mut f = unsafe { std::fs::File::from_raw_fd(read_fd.into_raw_fd()) };
-            let mut buf = String::new();
-            if f.read_to_string(&mut buf).is_ok() && !buf.is_empty() {
-                write_to_pasteboard(&buf);
-            }
-        });
+        log::info!("Clipboard: Wayland client published text as {mime}");
+        crate::diagnostics::record_clipboard_guest_offer(&mime);
+        self.pending_guest_clipboard_mime = Some(mime);
     }
 
     fn send_selection(
@@ -431,14 +632,15 @@ impl SelectionHandler for AppState {
         if ty != SelectionTarget::Clipboard {
             return;
         }
-        if !mime_type.starts_with("text/plain") {
+        if !is_clipboard_text_mime(&mime_type) {
             return;
         }
+        log::info!("Clipboard: Wayland client requested macOS text as {mime_type}");
+        let text = self.host_clipboard_text.clone();
         std::thread::spawn(move || {
             use std::io::Write;
-            use std::os::unix::io::{FromRawFd, IntoRawFd};
-            if let Some(text) = read_from_pasteboard() {
-                let mut f = unsafe { std::fs::File::from_raw_fd(fd.into_raw_fd()) };
+            if let Some(text) = text {
+                let mut f = std::fs::File::from(fd);
                 let _ = f.write_all(text.as_bytes());
             }
         });
@@ -451,6 +653,14 @@ impl DataDeviceHandler for AppState {
 }
 impl WaylandDndGrabHandler for AppState {}
 delegate_data_device!(AppState);
+impl smithay::wayland::selection::wlr_data_control::DataControlHandler for AppState {
+    fn data_control_state(
+        &mut self,
+    ) -> &mut smithay::wayland::selection::wlr_data_control::DataControlState {
+        &mut self.data_control_state
+    }
+}
+smithay::delegate_data_control!(AppState);
 use smithay::delegate_xdg_decoration;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 impl XdgDecorationHandler for AppState {
@@ -479,7 +689,10 @@ impl XdgDecorationHandler for AppState {
 delegate_xdg_decoration!(AppState);
 smithay::delegate_viewporter!(AppState);
 impl smithay::wayland::fractional_scale::FractionalScaleHandler for AppState {
-    fn new_fractional_scale(&mut self, surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface) {
+    fn new_fractional_scale(
+        &mut self,
+        surface: smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
         smithay::wayland::compositor::with_states(&surface, |states| {
             smithay::wayland::fractional_scale::with_fractional_scale(states, |fs| {
                 fs.set_preferred_scale(self.scale_factor);
@@ -493,13 +706,15 @@ impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for AppSta
         &mut self,
         _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         _pointer: &smithay::input::pointer::PointerHandle<Self>,
-    ) {}
+    ) {
+    }
     fn cursor_position_hint(
         &mut self,
         _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         _pointer: &smithay::input::pointer::PointerHandle<Self>,
         _location: smithay::utils::Point<f64, smithay::utils::Logical>,
-    ) {}
+    ) {
+    }
 }
 smithay::delegate_pointer_constraints!(AppState);
 smithay::delegate_relative_pointer!(AppState);
@@ -516,7 +731,85 @@ fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)
     Some((read, write))
 }
 
-fn write_to_pasteboard(text: &str) {
+fn clipboard_text_mime_types() -> Vec<String> {
+    [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "TEXT",
+        "STRING",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn is_clipboard_text_mime(mime: &str) -> bool {
+    let normalized = mime.trim().to_ascii_lowercase();
+    normalized == "utf8_string"
+        || normalized == "text"
+        || normalized == "string"
+        || normalized == "text/plain"
+        || normalized.starts_with("text/plain;")
+}
+
+fn preferred_clipboard_text_mime(mime_types: &[String]) -> Option<String> {
+    const PRIORITIES: [&str; 5] = [
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "utf8_string",
+        "text",
+        "string",
+    ];
+    PRIORITIES
+        .iter()
+        .find_map(|preferred| {
+            mime_types
+                .iter()
+                .find(|mime| mime.trim().eq_ignore_ascii_case(preferred))
+                .cloned()
+        })
+        .or_else(|| {
+            mime_types
+                .iter()
+                .find(|mime| is_clipboard_text_mime(mime))
+                .cloned()
+        })
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{is_clipboard_text_mime, preferred_clipboard_text_mime};
+
+    #[test]
+    fn chooses_the_exact_mime_offered_by_the_client() {
+        let offered = vec![
+            "image/png".to_string(),
+            "text/plain;charset=UTF-8".to_string(),
+            "UTF8_STRING".to_string(),
+        ];
+        assert_eq!(
+            preferred_clipboard_text_mime(&offered).as_deref(),
+            Some("text/plain;charset=UTF-8")
+        );
+    }
+
+    #[test]
+    fn accepts_wayland_and_xwayland_text_aliases() {
+        for mime in [
+            "text/plain",
+            "text/plain;charset=utf-8",
+            "UTF8_STRING",
+            "TEXT",
+            "STRING",
+        ] {
+            assert!(is_clipboard_text_mime(mime), "rejected {mime}");
+        }
+        assert!(!is_clipboard_text_mime("image/png"));
+    }
+}
+
+fn write_to_pasteboard(text: &str) -> isize {
     use objc2_app_kit::NSPasteboard;
     use objc2_foundation::NSString;
     unsafe {
@@ -525,14 +818,18 @@ fn write_to_pasteboard(text: &str) {
         let ns_str = NSString::from_str(text);
         let pb_type = objc2_app_kit::NSPasteboardTypeString;
         pb.setString_forType(&ns_str, pb_type);
+        pb.changeCount()
     }
 }
 
-fn read_from_pasteboard() -> Option<String> {
+fn pasteboard_snapshot() -> (isize, Option<String>) {
     use objc2_app_kit::NSPasteboard;
     unsafe {
         let pb = NSPasteboard::generalPasteboard();
         let pb_type = objc2_app_kit::NSPasteboardTypeString;
-        pb.stringForType(pb_type).map(|s| s.to_string())
+        (
+            pb.changeCount(),
+            pb.stringForType(pb_type).map(|s| s.to_string()),
+        )
     }
 }

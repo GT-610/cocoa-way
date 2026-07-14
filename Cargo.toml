@@ -1,23 +1,24 @@
 [package]
 name = "cocoa-way"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 license = "GPL-3.0-only"
 default-run = "cocoa-way"
 
 
 [dependencies]
-smithay = { path = "vendor/smithay", default-features = false, features = ["wayland_frontend"] }
-winit = { version = "0.29", default-features = false, features = ["rwh_06"] }
+smithay = { path = "vendor/smithay", default-features = false, features = ["wayland_frontend", "xkbcommon"] }
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 raw-window-handle = "0.6"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 core-graphics = "0.23"
 core-text = "20"
 core-foundation = "0.9"
 core-foundation-sys = "0.8"
 objc2 = { version = "0.5.2", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSString"] }
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSData", "NSString"] }
 objc2-metal = { version = "0.2.2", default-features = false, features = [
     "std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer",
     "MTLCommandEncoder", "MTLLibrary", "MTLRenderPipeline",
@@ -26,10 +27,13 @@ objc2-metal = { version = "0.2.2", default-features = false, features = [
 ] }
 objc2-app-kit = { version = "0.2.2", default-features = false, features = [
     "NSApplication", "NSMenu", "NSMenuItem", "NSResponder",
-    "NSWindow", "NSAlert", "NSView",
+    "NSWindow", "NSAlert", "NSView", "NSGraphics",
     "NSControl", "NSText", "NSTextField", "NSSecureTextField",
+    "NSButton", "NSPopUpButton", "NSScrollView", "NSTextView", "NSFont", "NSBox", "NSColor",
+    "NSOpenPanel", "NSSavePanel", "NSPanel",
     "NSPasteboard",
     "NSCursor",
+    "NSImage",
 ] }
 objc2-quartz-core = { version = "0.2.2", default-features = false, features = [
     "std", "CAMetalLayer", "CALayer", "objc2-metal",
@@ -52,3 +56,4 @@ pkg-config = "0.3"
 members = [
     "test-client"
 ]
+exclude = ["vendor/smithay"]

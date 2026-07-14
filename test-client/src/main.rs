@@ -1,7 +1,5 @@
 use wayland_client::{
-    protocol::wl_registry,
-    Connection, Dispatch, QueueHandle,
-    globals::GlobalListContents,
+    globals::GlobalListContents, protocol::wl_registry, Connection, Dispatch, QueueHandle,
 };
 struct App;
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
@@ -13,8 +11,16 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            println!("[Global] Interface: {}, Version: {}, Name: {}", interface, version, name);
+        if let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        {
+            println!(
+                "[Global] Interface: {}, Version: {}, Name: {}",
+                interface, version, name
+            );
         }
     }
 }
@@ -29,7 +35,8 @@ fn main() {
         }
     };
     println!("Connected! Initializing registry...");
-    let (globals, mut event_queue) = wayland_client::globals::registry_queue_init::<App>(&conn).unwrap();
+    let (_globals, mut event_queue) =
+        wayland_client::globals::registry_queue_init::<App>(&conn).unwrap();
     let mut app = App;
     println!("Roundtripping to fetch globals...");
     event_queue.roundtrip(&mut app).unwrap();

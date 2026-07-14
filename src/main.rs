@@ -1,59 +1,2539 @@
 use log::info;
-use std::sync::Arc;
-use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{ButtonEvent, MotionEvent};
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::{Display, ListeningSocket};
 use smithay::utils::SERIAL_COUNTER;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Sender;
+use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+mod connections;
+mod container_mode;
+mod container_sessions;
+mod control_api;
+mod control_protocol;
+mod diagnostics;
 mod keymap;
 mod layout;
-mod messages;
-mod render;
-mod state;
-mod metal_renderer;
-mod connections;
-mod container_sessions;
 mod menu_bar;
+mod messages;
+mod metal_renderer;
+mod render;
 mod runtime_paths;
+mod state;
 
-use messages::CompositorMessage;
 use crate::state::AppState;
+use messages::CompositorMessage;
+
+struct ActiveContainerSession {
+    index: usize,
+    container_child: Option<std::process::Child>,
+    waypipe_child: std::process::Child,
+    display_slot: String,
+    display_worker: Option<DisplayWorker>,
+}
+
+struct DisplayWorker {
+    child: std::process::Child,
+    runtime_dir: std::path::PathBuf,
+}
+
+struct ManagedDisplay {
+    slot: String,
+    runtime_dir: String,
+    display: String,
+    worker: DisplayWorker,
+}
+
+struct ActiveClassicConnection {
+    name: String,
+    child: std::process::Child,
+}
+
+fn start_classic_connection(
+    connection: &connections::Connection,
+    runtime_dir: &str,
+    display: &str,
+    active: &mut Vec<ActiveClassicConnection>,
+) -> Result<(), String> {
+    let child = connections::spawn_waypipe(connection, runtime_dir, display)?;
+    log::info!(
+        "Classic connection '{}' started through waypipe with pid {}",
+        connection.name,
+        child.id()
+    );
+    active.push(ActiveClassicConnection {
+        name: connection.name.clone(),
+        child,
+    });
+    Ok(())
+}
+
+fn reap_classic_connections(active: &mut Vec<ActiveClassicConnection>) {
+    active.retain_mut(|connection| match connection.child.try_wait() {
+        Ok(Some(status)) => {
+            log::info!(
+                "Classic connection '{}' exited with {}",
+                connection.name,
+                status
+            );
+            false
+        }
+        Ok(None) => true,
+        Err(error) => {
+            log::warn!(
+                "Could not inspect classic connection '{}': {}",
+                connection.name,
+                error
+            );
+            false
+        }
+    });
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DisplayAssignment {
+    Default,
+    Dedicated(String),
+}
+
+const DISPLAY_WORKER_SLOT_ENV: &str = "COCOA_WAY_DISPLAY_WORKER";
+const DISPLAY_WORKER_RUNTIME_ENV: &str = "COCOA_WAY_DISPLAY_RUNTIME_DIR";
+const DISPLAY_WORKER_READY_ENV: &str = "COCOA_WAY_DISPLAY_READY_FILE";
+const DISPLAY_WORKER_PARENT_ENV: &str = "COCOA_WAY_DISPLAY_PARENT_PID";
+const DISPLAY_WORKER_PANIC_LOG: &str = "worker-panic.log";
+static DISPLAY_WORKER_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn display_slot_slug(value: &str) -> String {
+    let slug = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if slug.is_empty() {
+        "display".into()
+    } else {
+        slug
+    }
+}
+
+fn choose_display_assignment(
+    session: &container_sessions::ContainerSession,
+    default_in_use: bool,
+) -> DisplayAssignment {
+    let requested = session.display.as_deref().map(str::trim).unwrap_or("auto");
+    match requested {
+        "" | "auto" if !default_in_use => DisplayAssignment::Default,
+        "" | "auto" | "dedicated" => {
+            DisplayAssignment::Dedicated(format!("session-{}", display_slot_slug(&session.name)))
+        }
+        "default" => DisplayAssignment::Default,
+        named => DisplayAssignment::Dedicated(display_slot_slug(named)),
+    }
+}
+
+fn active_display_conflict_index(
+    requested_index: usize,
+    sessions: &[container_sessions::ContainerSession],
+    active_slots: impl IntoIterator<Item = (usize, String)>,
+) -> Option<usize> {
+    let requested = sessions.get(requested_index)?;
+    let active_slots = active_slots.into_iter().collect::<Vec<_>>();
+    let default_in_use = active_slots
+        .iter()
+        .any(|(active_index, slot)| *active_index != requested_index && slot == "default");
+    let requested_slot = match choose_display_assignment(requested, default_in_use) {
+        DisplayAssignment::Default => "default".to_string(),
+        DisplayAssignment::Dedicated(slot) => slot,
+    };
+    active_slots
+        .into_iter()
+        .find(|(active_index, slot)| *active_index != requested_index && slot == &requested_slot)
+        .map(|(active_index, _)| active_index)
+}
+
+fn process_exists(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+fn display_worker_panic_detail(runtime_dir: &std::path::Path) -> Option<String> {
+    let detail = std::fs::read_to_string(runtime_dir.join(DISPLAY_WORKER_PANIC_LOG)).ok()?;
+    let detail = detail.trim();
+    if detail.is_empty() {
+        None
+    } else {
+        Some(
+            detail
+                .lines()
+                .take(12)
+                .collect::<Vec<_>>()
+                .join(" | ")
+                .chars()
+                .take(1_500)
+                .collect(),
+        )
+    }
+}
+
+fn install_display_worker_panic_report() {
+    let Some(runtime_dir) = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV) else {
+        return;
+    };
+    let panic_log = std::path::PathBuf::from(runtime_dir).join(DISPLAY_WORKER_PANIC_LOG);
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let report = format!(
+            "{}\n{}",
+            panic_info,
+            std::backtrace::Backtrace::force_capture()
+        );
+        let _ = std::fs::write(&panic_log, report);
+        previous_hook(panic_info);
+    }));
+}
+
+fn spawn_display_worker(slot: &str) -> Result<(DisplayWorker, String, String), String> {
+    let sequence = DISPLAY_WORKER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let runtime_dir =
+        std::path::PathBuf::from(format!("/tmp/cwd-{}-{}", std::process::id(), sequence));
+    std::fs::create_dir_all(&runtime_dir)
+        .map_err(|error| format!("failed to create display runtime directory: {}", error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("failed to secure display runtime directory: {}", error))?;
+    }
+    if let Err(error) = std::fs::write(runtime_dir.join("display.slot"), slot) {
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        return Err(format!(
+            "failed to publish dedicated display slot '{}': {}",
+            slot, error
+        ));
+    }
+    let ready_file = runtime_dir.join("display.ready");
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate Cocoa-Way executable: {}", error))?;
+    let mut child = std::process::Command::new(executable)
+        .env(DISPLAY_WORKER_SLOT_ENV, slot)
+        .env(DISPLAY_WORKER_RUNTIME_ENV, &runtime_dir)
+        .env(DISPLAY_WORKER_READY_ENV, &ready_file)
+        .env(DISPLAY_WORKER_PARENT_ENV, std::process::id().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|error| format!("failed to start dedicated display '{}': {}", slot, error))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        if let Ok(contents) = std::fs::read_to_string(&ready_file) {
+            let mut lines = contents.lines();
+            if let (Some(runtime), Some(display)) = (lines.next(), lines.next()) {
+                if !runtime.is_empty() && !display.is_empty() {
+                    return Ok((
+                        DisplayWorker { child, runtime_dir },
+                        runtime.into(),
+                        display.into(),
+                    ));
+                }
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let panic_detail = display_worker_panic_detail(&runtime_dir)
+                    .map(|detail| format!("; panic: {}", detail))
+                    .unwrap_or_default();
+                let _ = std::fs::remove_dir_all(&runtime_dir);
+                return Err(format!(
+                    "dedicated display '{}' exited before becoming ready: {}{}",
+                    slot, status, panic_detail
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(&runtime_dir);
+                return Err(format!(
+                    "failed to monitor dedicated display '{}': {}",
+                    slot, error
+                ));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&runtime_dir);
+    Err(format!(
+        "dedicated display '{}' did not publish a Wayland socket within 8 seconds",
+        slot
+    ))
+}
+
+fn spawn_display_worker_async(
+    index: usize,
+    display_slot: String,
+    sender: Sender<CompositorMessage>,
+) {
+    std::thread::spawn(move || {
+        let message = match spawn_display_worker(&display_slot) {
+            Ok((worker, runtime_dir, display)) => CompositorMessage::DedicatedDisplayStarted {
+                index,
+                display_slot,
+                runtime_dir,
+                display,
+                worker_child: worker.child,
+                worker_runtime_dir: worker.runtime_dir,
+            },
+            Err(error) => CompositorMessage::DedicatedDisplayFailed {
+                index,
+                display_slot,
+                error,
+            },
+        };
+        if let Err(send_error) = sender.send(message)
+            && let CompositorMessage::DedicatedDisplayStarted {
+                worker_child,
+                worker_runtime_dir,
+                ..
+            } = send_error.0
+        {
+            let mut worker = DisplayWorker {
+                child: worker_child,
+                runtime_dir: worker_runtime_dir,
+            };
+            let _ = terminate_display_worker(&mut worker);
+        }
+    });
+}
+
+fn spawn_managed_display_worker_async(display_slot: String, sender: Sender<CompositorMessage>) {
+    std::thread::spawn(move || {
+        let message = match spawn_display_worker(&display_slot) {
+            Ok((worker, runtime_dir, display)) => CompositorMessage::ManagedDisplayStarted {
+                display_slot,
+                runtime_dir,
+                display,
+                worker_child: worker.child,
+                worker_runtime_dir: worker.runtime_dir,
+            },
+            Err(error) => CompositorMessage::ManagedDisplayFailed {
+                display_slot,
+                error,
+            },
+        };
+        if let Err(send_error) = sender.send(message)
+            && let CompositorMessage::ManagedDisplayStarted {
+                worker_child,
+                worker_runtime_dir,
+                ..
+            } = send_error.0
+        {
+            let mut worker = DisplayWorker {
+                child: worker_child,
+                runtime_dir: worker_runtime_dir,
+            };
+            let _ = terminate_display_worker(&mut worker);
+        }
+    });
+}
+
+fn terminate_display_worker(worker: &mut DisplayWorker) -> Result<(), String> {
+    let result = terminate_child(&mut worker.child);
+    let cleanup = std::fs::remove_dir_all(&worker.runtime_dir).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    });
+    result.and(cleanup.map_err(|error| error.to_string()))
+}
+
+fn terminate_child(child: &mut std::process::Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            child.kill().map_err(|e| e.to_string())?;
+            child.wait().map_err(|e| e.to_string())?;
+            Ok(())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn stop_active_container_session(
+    active: &mut Vec<ActiveContainerSession>,
+    index: usize,
+) -> Result<(), String> {
+    let Some(position) = active.iter().position(|session| session.index == index) else {
+        return Err("No active process is tracked for this session".into());
+    };
+    let mut session = active.remove(position);
+    let waypipe_result = terminate_child(&mut session.waypipe_child);
+    let container_result = if let Some(container_child) = session.container_child.as_mut() {
+        terminate_child(container_child)
+    } else {
+        Ok(())
+    };
+    let display_result = if let Some(display_worker) = session.display_worker.as_mut() {
+        terminate_display_worker(display_worker)
+    } else {
+        Ok(())
+    };
+    waypipe_result.and(container_result).and(display_result)
+}
+
+fn cleanup_named_container_session(index: usize) {
+    let Some(session) = container_sessions::load_sessions().get(index).cloned() else {
+        return;
+    };
+    if let Err(error) = container_sessions::cleanup_named_session(&session) {
+        log::warn!(
+            "Container session #{} named cleanup failed: {}",
+            index,
+            error
+        );
+    }
+}
+
+fn reap_exited_container_sessions(active: &mut Vec<ActiveContainerSession>) {
+    let mut position = 0;
+    while position < active.len() {
+        let index = active[position].index;
+        let display_worker_state = active[position]
+            .display_worker
+            .as_mut()
+            .map(|display_worker| display_worker.child.try_wait());
+        if let Some(worker_state) = display_worker_state {
+            match worker_state {
+                Ok(Some(status)) => {
+                    let mut session = active.remove(position);
+                    let _ = terminate_child(&mut session.waypipe_child);
+                    if let Some(container_child) = session.container_child.as_mut() {
+                        let _ = terminate_child(container_child);
+                    }
+                    if let Some(display_worker) = session.display_worker.as_ref() {
+                        let _ = std::fs::remove_dir_all(&display_worker.runtime_dir);
+                    }
+                    cleanup_named_container_session(index);
+                    container_mode::record_process_exit(
+                        index,
+                        "dedicated display",
+                        &status.to_string(),
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    let mut session = active.remove(position);
+                    let _ = terminate_child(&mut session.waypipe_child);
+                    if let Some(container_child) = session.container_child.as_mut() {
+                        let _ = terminate_child(container_child);
+                    }
+                    if let Some(display_worker) = session.display_worker.as_mut() {
+                        let _ = terminate_display_worker(display_worker);
+                    }
+                    cleanup_named_container_session(index);
+                    container_mode::record_process_exit(
+                        index,
+                        "dedicated display monitor",
+                        &format!("error: {}", error),
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+            }
+        }
+        if let Some(container_child) = active[position].container_child.as_mut() {
+            match container_child.try_wait() {
+                Ok(Some(status)) => {
+                    let mut session = active.remove(position);
+                    let _ = terminate_child(&mut session.waypipe_child);
+                    if let Some(display_worker) = session.display_worker.as_mut() {
+                        let _ = terminate_display_worker(display_worker);
+                    }
+                    cleanup_named_container_session(index);
+                    container_mode::record_process_exit(index, "container", &status.to_string());
+                    continue;
+                }
+                Err(error) => {
+                    let mut session = active.remove(position);
+                    let _ = terminate_child(&mut session.waypipe_child);
+                    if let Some(display_worker) = session.display_worker.as_mut() {
+                        let _ = terminate_display_worker(display_worker);
+                    }
+                    cleanup_named_container_session(index);
+                    container_mode::record_process_exit(
+                        index,
+                        "container monitor",
+                        &format!("error: {}", error),
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+            }
+        }
+
+        match active[position].waypipe_child.try_wait() {
+            Ok(Some(status)) => {
+                let mut session = active.remove(position);
+                if let Some(container_child) = session.container_child.as_mut() {
+                    let _ = terminate_child(container_child);
+                }
+                if let Some(display_worker) = session.display_worker.as_mut() {
+                    let _ = terminate_display_worker(display_worker);
+                }
+                cleanup_named_container_session(index);
+                container_mode::record_process_exit(index, "waypipe", &status.to_string());
+                continue;
+            }
+            Err(error) => {
+                let mut session = active.remove(position);
+                if let Some(container_child) = session.container_child.as_mut() {
+                    let _ = terminate_child(container_child);
+                }
+                if let Some(display_worker) = session.display_worker.as_mut() {
+                    let _ = terminate_display_worker(display_worker);
+                }
+                cleanup_named_container_session(index);
+                container_mode::record_process_exit(
+                    index,
+                    "waypipe monitor",
+                    &format!("error: {}", error),
+                );
+                continue;
+            }
+            Ok(None) => {}
+        }
+
+        position += 1;
+    }
+}
+
+fn sync_active_container_sessions(active: &[ActiveContainerSession]) {
+    container_mode::record_active_container_sessions(
+        active
+            .iter()
+            .map(|session| {
+                (
+                    session.index,
+                    session.container_child.as_ref().map(|child| child.id()),
+                    session.waypipe_child.id(),
+                    session.display_slot.clone(),
+                    session
+                        .display_worker
+                        .as_ref()
+                        .map(|worker| worker.child.id()),
+                )
+            })
+            .collect(),
+    );
+}
+
+fn sync_managed_displays(displays: &[ManagedDisplay]) {
+    container_mode::record_managed_displays(
+        displays
+            .iter()
+            .map(|display| {
+                (
+                    display.slot.clone(),
+                    display.runtime_dir.clone(),
+                    display.display.clone(),
+                    display.worker.child.id(),
+                )
+            })
+            .collect(),
+    );
+}
+
+fn next_managed_display_slot(
+    displays: &[ManagedDisplay],
+    pending: &std::collections::HashSet<String>,
+    active: &[ActiveContainerSession],
+) -> String {
+    for number in 1usize.. {
+        let candidate = format!("display-{}", number);
+        if !displays.iter().any(|display| display.slot == candidate)
+            && !pending.contains(&candidate)
+            && !active
+                .iter()
+                .any(|session| session.display_slot == candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("the display slot counter is unbounded")
+}
+
+fn reap_exited_managed_displays(
+    displays: &mut Vec<ManagedDisplay>,
+    active: &mut Vec<ActiveContainerSession>,
+) {
+    let mut position = 0;
+    while position < displays.len() {
+        let state = displays[position].worker.child.try_wait();
+        match state {
+            Ok(Some(status)) => {
+                let display = displays.remove(position);
+                let affected = active
+                    .iter()
+                    .filter(|session| session.display_slot == display.slot)
+                    .map(|session| session.index)
+                    .collect::<Vec<_>>();
+                for index in affected {
+                    let _ = stop_active_container_session(active, index);
+                    cleanup_named_container_session(index);
+                }
+                let _ = std::fs::remove_dir_all(&display.worker.runtime_dir);
+                container_mode::record_managed_display_exit(&display.slot, &status.to_string());
+            }
+            Ok(None) => position += 1,
+            Err(error) => {
+                let mut display = displays.remove(position);
+                let _ = terminate_display_worker(&mut display.worker);
+                container_mode::record_managed_display_exit(
+                    &display.slot,
+                    &format!("monitor error: {}", error),
+                );
+            }
+        }
+    }
+}
+
+fn spawn_output_reader<R>(
+    sender: Sender<CompositorMessage>,
+    index: usize,
+    source: &'static str,
+    reader: R,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = sender.send(CompositorMessage::ContainerSessionLog {
+                        index,
+                        source: source.into(),
+                        line,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::ContainerSessionLog {
+                        index,
+                        source: source.into(),
+                        line: format!("failed to read process output: {}", error),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn attach_container_logs(
+    sender: &Sender<CompositorMessage>,
+    index: usize,
+    report: &mut container_sessions::LaunchReport,
+) {
+    if let Some(container_child) = report.container_child.as_mut() {
+        if let Some(stdout) = container_child.stdout.take() {
+            spawn_output_reader(sender.clone(), index, "container stdout", stdout);
+        }
+        if let Some(stderr) = container_child.stderr.take() {
+            spawn_output_reader(sender.clone(), index, "container stderr", stderr);
+        }
+    }
+    if let Some(stdout) = report.waypipe_child.stdout.take() {
+        spawn_output_reader(sender.clone(), index, "waypipe stdout", stdout);
+    }
+    if let Some(stderr) = report.waypipe_child.stderr.take() {
+        spawn_output_reader(sender.clone(), index, "waypipe stderr", stderr);
+    }
+}
+
+fn launch_container_session_on_display(
+    index: usize,
+    session: &container_sessions::ContainerSession,
+    runtime_dir: &str,
+    display: &str,
+    display_slot: String,
+    mut display_worker: Option<DisplayWorker>,
+    sender: &Sender<CompositorMessage>,
+    active: &mut Vec<ActiveContainerSession>,
+) {
+    match container_sessions::launch_session(session, runtime_dir, display) {
+        Ok(mut report) => {
+            log::info!(
+                "Container session #{} started through {} on {} using display {}",
+                index,
+                report.runtime,
+                report.host_socket,
+                display_slot
+            );
+            container_mode::record_launch_success(index, &report);
+            attach_container_logs(sender, index, &mut report);
+            active.push(ActiveContainerSession {
+                index,
+                container_child: report.container_child,
+                waypipe_child: report.waypipe_child,
+                display_slot,
+                display_worker,
+            });
+            sync_active_container_sessions(active);
+        }
+        Err(error) => {
+            if let Some(worker) = display_worker.as_mut() {
+                let _ = terminate_display_worker(worker);
+            }
+            if error.is_apple_container_transport_blocked() {
+                log::info!("Container session #{} is blocked: {}", index, error);
+            } else if error.is_container_already_running() {
+                log::info!("Container session #{} is already running: {}", index, error);
+            } else {
+                log::error!("Container session #{} failed: {}", index, error);
+            }
+            container_mode::record_launch_failure(index, &error);
+        }
+    }
+}
+
+fn container_data_root() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".into());
+    format!("{}/Library/Application Support/com.apple.container", home)
+}
+
+fn available_disk_gib(path: &str) -> Option<f64> {
+    let output = std::process::Command::new("/bin/df")
+        .args(["-Pk", path])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let available_kib: u64 = stdout
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .nth(3)?
+        .parse()
+        .ok()?;
+    Some(available_kib as f64 / 1024.0 / 1024.0)
+}
+
+fn warn_low_container_disk_for_image_task(
+    sender: &Sender<CompositorMessage>,
+    runtime: &str,
+    image: &str,
+) {
+    let root = container_data_root();
+    if let Some(free_gib) = available_disk_gib(&root) {
+        if free_gib < 8.0 {
+            let _ = sender.send(CompositorMessage::ContainerImagePullLog {
+                runtime: runtime.into(),
+                image: image.into(),
+                line: format!(
+                    "Low disk space: {:.1}G free at {}. Image operations may fail.",
+                    free_gib, root
+                ),
+            });
+        }
+    }
+}
+
+fn image_pull_command(
+    runtime: &str,
+    image: String,
+    platform: Option<&str>,
+    scheme: Option<&str>,
+) -> Result<(&'static str, Vec<String>), String> {
+    let runtime_key = runtime.trim().to_ascii_lowercase();
+    match runtime_key.as_str() {
+        "container" | "apple" | "apple container" => {
+            let mut args = vec![
+                "image".into(),
+                "pull".into(),
+                "--progress".into(),
+                "plain".into(),
+            ];
+            if let Some(scheme) = scheme {
+                args.extend(["--scheme".into(), scheme.into()]);
+            }
+            if let Some(platform) = platform {
+                args.extend(["--platform".into(), platform.into()]);
+            }
+            args.push(image);
+            Ok(("container", args))
+        }
+        "docker" => {
+            let mut args = vec!["pull".into()];
+            if let Some(platform) = platform {
+                args.extend(["--platform".into(), platform.into()]);
+            }
+            args.push(image);
+            Ok(("docker", args))
+        }
+        "orb" | "orbstack" => Err(
+            "OrbStack image pull uses its Docker-compatible context; select that destination instead."
+                .into(),
+        ),
+        _ => Err("Unsupported runtime. Use `container` or `docker`.".into()),
+    }
+}
+
+fn spawn_image_pull(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    image: String,
+    platform: Option<String>,
+    scheme: Option<String>,
+) {
+    std::thread::spawn(move || {
+        warn_low_container_disk_for_image_task(&sender, &runtime, &image);
+        let child_path = runtime_paths::build_child_path();
+        let (command, args) = match image_pull_command(
+            &runtime,
+            image.clone(),
+            platform.as_deref(),
+            scheme.as_deref(),
+        ) {
+            Ok(command) => command,
+            Err(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime,
+                    image,
+                    success: false,
+                    status,
+                });
+                return;
+            }
+        };
+
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime,
+                image,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime,
+                    image,
+                    success: false,
+                    status: format!("Failed to start image pull: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_image_pull_reader(sender.clone(), runtime.clone(), image.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_image_pull_reader(sender.clone(), runtime.clone(), image.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime,
+                    image,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime,
+                    image,
+                    success: false,
+                    status: format!("Failed to wait for image pull: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_image_pull_reader<R>(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    image: String,
+    reader: R,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = sender.send(CompositorMessage::ContainerImagePullLog {
+                        runtime: runtime.clone(),
+                        image: image.clone(),
+                        line,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::ContainerImagePullLog {
+                        runtime: runtime.clone(),
+                        image: image.clone(),
+                        line: format!("failed to read image pull output: {}", error),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_registry_login(
+    sender: Sender<CompositorMessage>,
+    server: String,
+    username: String,
+    password: String,
+    scheme: Option<String>,
+) {
+    std::thread::spawn(move || {
+        let action = format!("registry login {}", server);
+        let child_path = runtime_paths::build_child_path();
+        let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
+            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                runtime: "apple".into(),
+                action,
+                success: false,
+                status: "Missing command `container`.".into(),
+            });
+            return;
+        };
+        let args = registry_login_args(&server, &username, scheme.as_deref());
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime: "apple".into(),
+                    action,
+                    success: false,
+                    status: format!("Failed to start registry login: {}", error),
+                });
+                return;
+            }
+        };
+
+        let write_result = child.stdin.take().map(|mut stdin| {
+            stdin.write_all(password.as_bytes())?;
+            stdin.write_all(b"\n")
+        });
+        if let Some(Err(error)) = write_result {
+            let _ = child.kill();
+            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                runtime: "apple".into(),
+                action,
+                success: false,
+                status: format!("Failed to send registry credentials: {}", error),
+            });
+            return;
+        }
+
+        match child.wait_with_output() {
+            Ok(output) => {
+                for line in String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&output.stderr).lines())
+                    .filter(|line| !line.trim().is_empty())
+                {
+                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
+                        runtime: "apple".into(),
+                        action: action.clone(),
+                        line: line.to_string(),
+                    });
+                }
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime: "apple".into(),
+                    action,
+                    success: output.status.success(),
+                    status: output.status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime: "apple".into(),
+                    action,
+                    success: false,
+                    status: format!("Failed to wait for registry login: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn registry_login_args(server: &str, username: &str, scheme: Option<&str>) -> Vec<String> {
+    let mut args = vec![
+        "registry".to_string(),
+        "login".into(),
+        "--password-stdin".into(),
+        "--username".into(),
+        username.into(),
+    ];
+    if let Some(scheme) = scheme {
+        args.extend(["--scheme".into(), scheme.into()]);
+    }
+    args.push(server.into());
+    args
+}
+
+fn spawn_image_load(sender: Sender<CompositorMessage>, path: String) {
+    std::thread::spawn(move || {
+        warn_low_container_disk_for_image_task(&sender, "load", &path);
+        let child_path = runtime_paths::build_child_path();
+        let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime: "load".into(),
+                image: path,
+                success: false,
+                status: "Missing command `container`.".into(),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(["image", "load", "--input", &path])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "load".into(),
+                    image: path,
+                    success: false,
+                    status: format!("Failed to start image load: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_image_pull_reader(sender.clone(), "load".into(), path.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_image_pull_reader(sender.clone(), "load".into(), path.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "load".into(),
+                    image: path,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "load".into(),
+                    image: path,
+                    success: false,
+                    status: format!("Failed to wait for image load: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_image_build(
+    sender: Sender<CompositorMessage>,
+    image: String,
+    containerfile: String,
+    context: String,
+) {
+    std::thread::spawn(move || {
+        warn_low_container_disk_for_image_task(&sender, "build", &image);
+        let child_path = runtime_paths::build_child_path();
+        let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime: "build".into(),
+                image,
+                success: false,
+                status: "Missing command `container`.".into(),
+            });
+            return;
+        };
+
+        let args = [
+            "build".to_string(),
+            "--progress".to_string(),
+            "plain".to_string(),
+            "-f".to_string(),
+            containerfile,
+            "-t".to_string(),
+            image.clone(),
+            context,
+        ];
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "build".into(),
+                    image,
+                    success: false,
+                    status: format!("Failed to start image build: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_image_pull_reader(sender.clone(), "build".into(), image.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_image_pull_reader(sender.clone(), "build".into(), image.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "build".into(),
+                    image,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "build".into(),
+                    image,
+                    success: false,
+                    status: format!("Failed to wait for image build: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_apple_container_system_start(sender: Sender<CompositorMessage>) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime: "system".into(),
+                image: "Apple Container".into(),
+                success: false,
+                status: "Missing command `container`.".into(),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(["system", "start"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "system".into(),
+                    image: "Apple Container".into(),
+                    success: false,
+                    status: format!("Failed to start Apple Container system: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_image_pull_reader(
+                sender.clone(),
+                "system".into(),
+                "Apple Container".into(),
+                stdout,
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_image_pull_reader(
+                sender.clone(),
+                "system".into(),
+                "Apple Container".into(),
+                stderr,
+            );
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "system".into(),
+                    image: "Apple Container".into(),
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "system".into(),
+                    image: "Apple Container".into(),
+                    success: false,
+                    status: format!("Failed to wait for Apple Container system start: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_image_delete(sender: Sender<CompositorMessage>, runtime: String, image: String) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let runtime_key = runtime.trim().to_ascii_lowercase();
+        let (command, args): (&str, Vec<String>) = match runtime_key.as_str() {
+            "container" | "apple" | "apple container" => (
+                "container",
+                vec!["image".into(), "delete".into(), image.clone()],
+            ),
+            "docker" => ("docker", vec!["image".into(), "rm".into(), image.clone()]),
+            _ => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "delete".into(),
+                    image,
+                    success: false,
+                    status: "Unsupported runtime. Use `container` or `docker`.".into(),
+                });
+                return;
+            }
+        };
+
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                runtime: "delete".into(),
+                image,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "delete".into(),
+                    image,
+                    success: false,
+                    status: format!("Failed to start image delete: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_image_pull_reader(sender.clone(), "delete".into(), image.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_image_pull_reader(sender.clone(), "delete".into(), image.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "delete".into(),
+                    image,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerImagePullFinished {
+                    runtime: "delete".into(),
+                    image,
+                    success: false,
+                    status: format!("Failed to wait for image delete: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_volume_delete(sender: Sender<CompositorMessage>, runtime: String, volume: String) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let runtime_key = runtime.trim().to_ascii_lowercase();
+        let (command, args): (&str, Vec<String>) = match runtime_key.as_str() {
+            "container" | "apple" | "apple container" => (
+                "container",
+                vec!["volume".into(), "delete".into(), volume.clone()],
+            ),
+            "docker" => ("docker", vec!["volume".into(), "rm".into(), volume.clone()]),
+            _ => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: "Unsupported runtime. Use `container` or `docker`.".into(),
+                });
+                return;
+            }
+        };
+
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+                runtime,
+                volume,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: format!("Failed to start volume delete: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_volume_delete_reader(sender.clone(), runtime.clone(), volume.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_volume_delete_reader(sender.clone(), runtime.clone(), volume.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+                    runtime,
+                    volume,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeDeleteFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: format!("Failed to wait for volume delete: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_volume_create(sender: Sender<CompositorMessage>, runtime: String, volume: String) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let runtime_key = runtime.trim().to_ascii_lowercase();
+        let (command, args): (&str, Vec<String>) = match runtime_key.as_str() {
+            "container" | "apple" | "apple container" => (
+                "container",
+                vec!["volume".into(), "create".into(), volume.clone()],
+            ),
+            "docker" => (
+                "docker",
+                vec!["volume".into(), "create".into(), volume.clone()],
+            ),
+            _ => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeCreateFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: "Unsupported runtime. Use `container` or `docker`.".into(),
+                });
+                return;
+            }
+        };
+
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::ContainerVolumeCreateFinished {
+                runtime,
+                volume,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeCreateFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: format!("Failed to start volume create: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_volume_create_reader(sender.clone(), runtime.clone(), volume.clone(), stdout);
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_volume_create_reader(sender.clone(), runtime.clone(), volume.clone(), stderr);
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeCreateFinished {
+                    runtime,
+                    volume,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::ContainerVolumeCreateFinished {
+                    runtime,
+                    volume,
+                    success: false,
+                    status: format!("Failed to wait for volume create: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn spawn_volume_create_reader<R>(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    volume: String,
+    reader: R,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = sender.send(CompositorMessage::ContainerVolumeCreateLog {
+                        runtime: runtime.clone(),
+                        volume: volume.clone(),
+                        line,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::ContainerVolumeCreateLog {
+                        runtime: runtime.clone(),
+                        volume: volume.clone(),
+                        line: format!("failed to read volume create output: {}", error),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_volume_delete_reader<R>(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    volume: String,
+    reader: R,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = sender.send(CompositorMessage::ContainerVolumeDeleteLog {
+                        runtime: runtime.clone(),
+                        volume: volume.clone(),
+                        line,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::ContainerVolumeDeleteLog {
+                        runtime: runtime.clone(),
+                        volume: volume.clone(),
+                        line: format!("failed to read volume delete output: {}", error),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_runtime_container_action(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+    action: String,
+) {
+    if action == "restart"
+        && matches!(
+            runtime.trim().to_ascii_lowercase().as_str(),
+            "apple" | "container"
+        )
+    {
+        spawn_apple_runtime_container_restart(sender, runtime, name);
+        return;
+    }
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let Some((command, args)) = runtime_container_command(&runtime, &action, &name) else {
+            let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                runtime,
+                name,
+                action,
+                success: false,
+                status: "Unsupported runtime action.".into(),
+            });
+            return;
+        };
+
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                runtime,
+                name,
+                action,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let mut child = match std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                    runtime,
+                    name,
+                    action,
+                    success: false,
+                    status: format!("Failed to start container action: {}", error),
+                });
+                return;
+            }
+        };
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_runtime_container_action_reader(
+                sender.clone(),
+                runtime.clone(),
+                name.clone(),
+                action.clone(),
+                stdout,
+            );
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_runtime_container_action_reader(
+                sender.clone(),
+                runtime.clone(),
+                name.clone(),
+                action.clone(),
+                stderr,
+            );
+        }
+
+        match child.wait() {
+            Ok(status) => {
+                let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                    runtime,
+                    name,
+                    action,
+                    success: status.success(),
+                    status: status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                    runtime,
+                    name,
+                    action,
+                    success: false,
+                    status: format!("Failed to wait for container action: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn runtime_container_command(
+    runtime: &str,
+    action: &str,
+    name: &str,
+) -> Option<(&'static str, Vec<String>)> {
+    let runtime = runtime.trim().to_ascii_lowercase();
+    match (runtime.as_str(), action) {
+        ("apple" | "container", "start" | "stop") => {
+            Some(("container", vec![action.into(), name.into()]))
+        }
+        ("apple" | "container", "delete") => Some((
+            "container",
+            vec!["delete".into(), "--force".into(), name.into()],
+        )),
+        ("docker" | "orb" | "orbstack", "start" | "stop") => {
+            Some(("docker", vec![action.into(), name.into()]))
+        }
+        ("docker" | "orb" | "orbstack", "restart") => {
+            Some(("docker", vec!["restart".into(), name.into()]))
+        }
+        ("docker" | "orb" | "orbstack", "delete") => {
+            Some(("docker", vec!["rm".into(), "-f".into(), name.into()]))
+        }
+        _ => None,
+    }
+}
+
+fn spawn_apple_runtime_container_restart(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let Some(command_path) = runtime_paths::find_command_path("container", &child_path) else {
+            let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                runtime,
+                name,
+                action: "restart".into(),
+                success: false,
+                status: "Missing command `container`.".into(),
+            });
+            return;
+        };
+        for phase in ["stop", "start"] {
+            let output = std::process::Command::new(&command_path)
+                .env("PATH", &child_path)
+                .args([phase, &name])
+                .output();
+            let output = match output {
+                Ok(output) => output,
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                        runtime,
+                        name,
+                        action: "restart".into(),
+                        success: false,
+                        status: format!("Failed to {} Apple container: {}", phase, error),
+                    });
+                    return;
+                }
+            };
+            for line in String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .chain(String::from_utf8_lossy(&output.stderr).lines())
+                .filter(|line| !line.trim().is_empty())
+            {
+                let _ = sender.send(CompositorMessage::RuntimeContainerActionLog {
+                    runtime: runtime.clone(),
+                    name: name.clone(),
+                    action: "restart".into(),
+                    line: format!("{}: {}", phase, line),
+                });
+            }
+            if !output.status.success() {
+                let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+                    runtime,
+                    name,
+                    action: "restart".into(),
+                    success: false,
+                    status: format!("container {} failed with {}", phase, output.status),
+                });
+                return;
+            }
+        }
+        let _ = sender.send(CompositorMessage::RuntimeContainerActionFinished {
+            runtime,
+            name,
+            action: "restart".into(),
+            success: true,
+            status: "stopped and started".into(),
+        });
+    });
+}
+
+fn spawn_runtime_container_action_reader<R>(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+    action: String,
+    reader: R,
+) where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => {
+                    let _ = sender.send(CompositorMessage::RuntimeContainerActionLog {
+                        runtime: runtime.clone(),
+                        name: name.clone(),
+                        action: action.clone(),
+                        line,
+                    });
+                }
+                Err(error) => {
+                    let _ = sender.send(CompositorMessage::RuntimeContainerActionLog {
+                        runtime: runtime.clone(),
+                        name: name.clone(),
+                        action: action.clone(),
+                        line: format!("failed to read runtime container output: {}", error),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_runtime_system_action(sender: Sender<CompositorMessage>, runtime: String, action: String) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let runtime_key = runtime.trim().to_ascii_lowercase();
+        let (command, args): (&str, Vec<&str>) = match runtime_key.as_str() {
+            "apple" | "container" => ("container", vec!["system", action.as_str()]),
+            "orb" | "orbstack" => ("orbctl", vec![action.as_str()]),
+            _ => {
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime,
+                    action,
+                    success: false,
+                    status: "Unsupported runtime system action.".into(),
+                });
+                return;
+            }
+        };
+        if !matches!(action.as_str(), "start" | "stop") {
+            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                runtime,
+                action,
+                success: false,
+                status: "Unsupported runtime system action.".into(),
+            });
+            return;
+        }
+        let Some(command_path) = runtime_paths::find_command_path(command, &child_path) else {
+            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                runtime,
+                action,
+                success: false,
+                status: format!("Missing command `{}`.", command),
+            });
+            return;
+        };
+
+        let output = std::process::Command::new(&command_path)
+            .env("PATH", &child_path)
+            .args(args)
+            .output();
+        match output {
+            Ok(output) => {
+                for line in String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&output.stderr).lines())
+                    .filter(|line| !line.trim().is_empty())
+                {
+                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
+                        runtime: runtime.clone(),
+                        action: action.clone(),
+                        line: line.to_string(),
+                    });
+                }
+                let mut success = output.status.success();
+                let mut status = output.status.to_string();
+                if success && matches!(runtime_key.as_str(), "orb" | "orbstack") {
+                    match wait_for_orbstack_state(&command_path, &child_path, action == "start") {
+                        Ok(observed) => status = observed,
+                        Err(error) => {
+                            success = false;
+                            status = error;
+                        }
+                    }
+                }
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime,
+                    action,
+                    success,
+                    status,
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime,
+                    action,
+                    success: false,
+                    status: format!("Failed to run runtime action: {}", error),
+                });
+            }
+        }
+    });
+}
+
+fn wait_for_orbstack_state(
+    command_path: &std::path::Path,
+    child_path: &str,
+    expected_running: bool,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    let mut last_status = "status unavailable".to_string();
+    while std::time::Instant::now() < deadline {
+        match std::process::Command::new(command_path)
+            .env("PATH", child_path)
+            .arg("status")
+            .output()
+        {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                last_status = [stdout.trim(), stderr.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if parse_orbstack_running(&last_status) == Some(expected_running) {
+                    return Ok(format!(
+                        "OrbStack is {}",
+                        if expected_running {
+                            "running"
+                        } else {
+                            "stopped"
+                        }
+                    ));
+                }
+            }
+            Err(error) => last_status = error.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err(format!(
+        "OrbStack did not reach the expected {} state: {}",
+        if expected_running {
+            "running"
+        } else {
+            "stopped"
+        },
+        last_status
+    ))
+}
+
+fn parse_orbstack_running(status: &str) -> Option<bool> {
+    let status = status.trim().to_ascii_lowercase();
+    if status.contains("stopped") || status.contains("not running") {
+        Some(false)
+    } else if status.contains("running") {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn spawn_docker_context_switch(sender: Sender<CompositorMessage>, name: String) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let action = format!("context use {}", name);
+        let Some(command_path) = runtime_paths::find_command_path("docker", &child_path) else {
+            let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                runtime: "docker".into(),
+                action,
+                success: false,
+                status: "Missing command `docker`.".into(),
+            });
+            return;
+        };
+        let output = std::process::Command::new(command_path)
+            .env("PATH", &child_path)
+            .args(["context", "use", &name])
+            .output();
+        match output {
+            Ok(output) => {
+                for line in String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .chain(String::from_utf8_lossy(&output.stderr).lines())
+                    .filter(|line| !line.trim().is_empty())
+                {
+                    let _ = sender.send(CompositorMessage::RuntimeSystemActionLog {
+                        runtime: "docker".into(),
+                        action: action.clone(),
+                        line: line.to_string(),
+                    });
+                }
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime: "docker".into(),
+                    action,
+                    success: output.status.success(),
+                    status: output.status.to_string(),
+                });
+            }
+            Err(error) => {
+                let _ = sender.send(CompositorMessage::RuntimeSystemActionFinished {
+                    runtime: "docker".into(),
+                    action,
+                    success: false,
+                    status: format!("Failed to switch Docker context: {}", error),
+                });
+            }
+        }
+    });
+}
+
+struct RuntimeDetailCommands {
+    command: &'static str,
+    info: Vec<String>,
+    logs: Vec<String>,
+    stats: Vec<String>,
+}
+
+fn runtime_detail_commands(runtime: &str, name: &str) -> Option<RuntimeDetailCommands> {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "apple" | "container" => Some(RuntimeDetailCommands {
+            command: "container",
+            info: vec!["inspect".into(), name.into()],
+            logs: vec!["logs".into(), "-n".into(), "20".into(), name.into()],
+            stats: vec![
+                "stats".into(),
+                name.into(),
+                "--no-stream".into(),
+                "--format".into(),
+                "table".into(),
+            ],
+        }),
+        "docker" | "orb" | "orbstack" => Some(RuntimeDetailCommands {
+            command: "docker",
+            info: vec![
+                "inspect".into(),
+                "--format".into(),
+                "Name: {{.Name}}\nImage: {{.Config.Image}}\nState: {{.State.Status}}\nCreated: {{.Created}}".into(),
+                name.into(),
+            ],
+            logs: vec!["logs".into(), "--tail".into(), "20".into(), name.into()],
+            stats: vec![
+                "stats".into(),
+                "--no-stream".into(),
+                "--format".into(),
+                "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}".into(),
+                name.into(),
+            ],
+        }),
+        _ => None,
+    }
+}
+
+fn spawn_runtime_container_details(
+    sender: Sender<CompositorMessage>,
+    runtime: String,
+    name: String,
+) {
+    std::thread::spawn(move || {
+        let child_path = runtime_paths::build_child_path();
+        let Some(commands) = runtime_detail_commands(&runtime, &name) else {
+            let _ = sender.send(CompositorMessage::RuntimeContainerDetailsLoaded {
+                runtime,
+                name,
+                info: Vec::new(),
+                logs: Vec::new(),
+                stats: Vec::new(),
+                error: Some("Unsupported container runtime.".into()),
+            });
+            return;
+        };
+        let Some(command_path) = runtime_paths::find_command_path(commands.command, &child_path)
+        else {
+            let _ = sender.send(CompositorMessage::RuntimeContainerDetailsLoaded {
+                runtime,
+                name,
+                info: Vec::new(),
+                logs: Vec::new(),
+                stats: Vec::new(),
+                error: Some(format!("Missing command `{}`.", commands.command)),
+            });
+            return;
+        };
+
+        let (info, info_error) = runtime_detail_output(
+            &command_path,
+            &child_path,
+            &commands.info,
+            std::time::Duration::from_secs(3),
+            8,
+        );
+        let (logs, logs_error) = runtime_detail_output(
+            &command_path,
+            &child_path,
+            &commands.logs,
+            std::time::Duration::from_secs(3),
+            20,
+        );
+        let (stats, stats_error) = runtime_detail_output(
+            &command_path,
+            &child_path,
+            &commands.stats,
+            std::time::Duration::from_secs(3),
+            5,
+        );
+        let errors = [info_error, logs_error, stats_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let _ = sender.send(CompositorMessage::RuntimeContainerDetailsLoaded {
+            runtime,
+            name,
+            info,
+            logs,
+            stats,
+            error: (!errors.is_empty()).then(|| errors.join("; ")),
+        });
+    });
+}
+
+fn runtime_detail_output(
+    command: &std::path::Path,
+    child_path: &str,
+    args: &[String],
+    timeout: std::time::Duration,
+    max_lines: usize,
+) -> (Vec<String>, Option<String>) {
+    let mut child = match std::process::Command::new(command)
+        .env("PATH", child_path)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return (Vec::new(), Some(error.to_string())),
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break child.wait_with_output().map_err(|error| error.to_string()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (
+                    Vec::new(),
+                    Some(format!("command timed out after {}ms", timeout.as_millis())),
+                );
+            }
+            Err(error) => return (Vec::new(), Some(error.to_string())),
+        }
+    };
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    let mut lines = if args.first().is_some_and(|arg| arg == "inspect") {
+        apple_inspect_summary(&output.stdout).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if lines.is_empty() {
+        lines = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .chain(String::from_utf8_lossy(&output.stderr).lines())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .take(max_lines)
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+    }
+    if lines.is_empty() {
+        lines.push("No output returned.".into());
+    }
+    let error =
+        (!output.status.success()).then(|| format!("command exited with {}", output.status));
+    (lines, error)
+}
+
+fn apple_inspect_summary(output: &[u8]) -> Option<Vec<String>> {
+    let value = serde_json::from_slice::<serde_json::Value>(output).ok()?;
+    let item = value
+        .as_array()
+        .and_then(|items| items.first())
+        .unwrap_or(&value);
+    let configuration = item.get("configuration").unwrap_or(item);
+    let status = item.get("status");
+    let id = configuration
+        .get("id")
+        .or_else(|| item.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let image = configuration
+        .pointer("/image/reference")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let state = status
+        .and_then(|status| status.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let os = configuration
+        .pointer("/platform/os")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("linux");
+    let architecture = configuration
+        .pointer("/platform/architecture")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let cpus = configuration
+        .pointer("/resources/cpus")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "auto".into());
+    let memory = configuration
+        .pointer("/resources/memoryInBytes")
+        .and_then(serde_json::Value::as_u64)
+        .map(|bytes| format!("{:.1} GiB", bytes as f64 / 1024.0 / 1024.0 / 1024.0))
+        .unwrap_or_else(|| "auto".into());
+    Some(vec![
+        format!("ID: {}", id),
+        format!("Image: {}", image),
+        format!("State: {}", state),
+        format!("Platform: {}/{}", os, architecture),
+        format!("Resources: {} CPU · {}", cpus, memory),
+    ])
+}
+
+fn applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn open_runtime_container_terminal(runtime: &str, name: &str) -> Result<(), String> {
+    let child_path = runtime_paths::build_child_path();
+    let command = match runtime.trim().to_ascii_lowercase().as_str() {
+        "apple" | "container" => "container",
+        "docker" | "orb" | "orbstack" => "docker",
+        _ => return Err(format!("Unsupported runtime `{}`.", runtime)),
+    };
+    let command_path = runtime_paths::find_command_path(command, &child_path)
+        .ok_or_else(|| format!("Command `{}` was not found.", command))?;
+    let terminal_command = format!(
+        "{} exec -it {} sh -lc {}",
+        runtime_paths::shell_single_quote(&command_path.display().to_string()),
+        runtime_paths::shell_single_quote(name),
+        runtime_paths::shell_single_quote("exec ${SHELL:-/bin/sh}")
+    );
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        applescript_string(&terminal_command)
+    );
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn open_container_terminal(index: usize) -> Result<(), String> {
+    let sessions = container_sessions::load_sessions();
+    let Some(session) = sessions.get(index) else {
+        return Err("Session no longer exists".into());
+    };
+    let command = container_sessions::terminal_command(session);
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        applescript_string(&command)
+    );
+    std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[allow(deprecated)] // winit 0.30 compatibility path; ApplicationHandler migration is separate.
 fn main() {
+    if let Some(socket) = std::env::var_os("COCOA_WAY_ASKPASS_SOCKET") {
+        let mut secret = String::new();
+        let result = std::os::unix::net::UnixStream::connect(socket)
+            .and_then(|mut stream| stream.read_to_string(&mut secret));
+        match result {
+            Ok(_) => {
+                println!("{}", secret);
+                return;
+            }
+            Err(_) => std::process::exit(1),
+        }
+    }
+
+    if container_sessions::should_run_container_relay() {
+        std::process::exit(container_sessions::run_container_relay_from_env());
+    }
+
+    install_display_worker_panic_report();
+
     // Default filter: our code at INFO, smithay/wayland noise at WARN only.
     // Override with RUST_LOG env var.
-    let filter = std::env::var("RUST_LOG")
-        .unwrap_or_else(|_| "cocoa_way=info,smithay=warn,wayland_server=warn,wayland_client=warn".into());
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| {
+        "cocoa_way=info,smithay=warn,wayland_server=warn,wayland_client=warn".into()
+    });
+    tracing_subscriber::fmt().with_env_filter(filter).init();
     let event_loop = EventLoop::new().unwrap();
-    // Build the window first, then hand it to the Metal renderer.
-    let window = winit::window::WindowBuilder::new()
-        .with_title("Cocoa-Way")
-        .with_inner_size(winit::dpi::LogicalSize::new(800.0f64, 600.0f64))
-        .build(&event_loop)
+    let mut event_handler = None;
+    event_loop
+        .run(move |event, target| {
+            if event_handler.is_none() {
+                if !matches!(event, Event::Resumed) {
+                    return;
+                }
+                event_handler = Some(create_event_handler(target));
+            }
+            if let Some(handler) = event_handler.as_mut() {
+                handler(event, target);
+            }
+        })
+        .unwrap();
+}
+
+#[cfg(test)]
+mod display_slot_tests {
+    use super::*;
+
+    #[test]
+    fn apple_image_pull_uses_plain_progress_and_selected_transport_options() {
+        let (command, args) = image_pull_command(
+            "container",
+            "docker.io/library/ubuntu:24.04".into(),
+            Some("linux/arm64"),
+            Some("https"),
+        )
+        .unwrap();
+        assert_eq!(command, "container");
+        assert_eq!(
+            args,
+            [
+                "image",
+                "pull",
+                "--progress",
+                "plain",
+                "--scheme",
+                "https",
+                "--platform",
+                "linux/arm64",
+                "docker.io/library/ubuntu:24.04",
+            ]
+        );
+    }
+
+    #[test]
+    fn docker_image_pull_uses_docker_platform_syntax() {
+        let (command, args) = image_pull_command(
+            "docker",
+            "ghcr.io/example/gui:latest".into(),
+            Some("linux/amd64"),
+            Some("http"),
+        )
+        .unwrap();
+        assert_eq!(command, "docker");
+        assert_eq!(
+            args,
+            [
+                "pull",
+                "--platform",
+                "linux/amd64",
+                "ghcr.io/example/gui:latest",
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_login_keeps_the_password_out_of_process_arguments() {
+        let args = registry_login_args("ghcr.io", "example", Some("https"));
+        assert_eq!(
+            args,
+            [
+                "registry",
+                "login",
+                "--password-stdin",
+                "--username",
+                "example",
+                "--scheme",
+                "https",
+                "ghcr.io",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "secret-token"));
+    }
+
+    fn session(name: &str, display: Option<&str>) -> container_sessions::ContainerSession {
+        container_sessions::ContainerSession {
+            name: name.into(),
+            image: "example:latest".into(),
+            runtime: "container".into(),
+            display: display.map(str::to_owned),
+            profile: None,
+            app: None,
+            command: Some("true".into()),
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            runtime_args: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_display_rejects_a_second_active_session() {
+        let sessions = vec![session("first", Some("auto")), session("second", None)];
+        assert_eq!(
+            active_display_conflict_index(1, &sessions, [(0, "default".into())]),
+            None
+        );
+
+        let sessions = vec![
+            session("first", Some("auto")),
+            session("second", Some("default")),
+        ];
+        assert_eq!(
+            active_display_conflict_index(1, &sessions, [(0, "default".into())]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn relaunching_the_tracked_session_is_not_a_display_conflict() {
+        let sessions = vec![session("first", Some("default"))];
+        assert_eq!(
+            active_display_conflict_index(0, &sessions, [(0, "default".into())]),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_display_does_not_claim_the_default_slot() {
+        let sessions = vec![
+            session("external", Some("external")),
+            session("default", None),
+        ];
+        assert_eq!(
+            active_display_conflict_index(0, &sessions, [(1, "default".into())]),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_display_uses_a_dedicated_worker_after_default_is_taken() {
+        let auto = session("Second Desktop", Some("auto"));
+        assert_eq!(
+            choose_display_assignment(&auto, false),
+            DisplayAssignment::Default
+        );
+        assert_eq!(
+            choose_display_assignment(&auto, true),
+            DisplayAssignment::Dedicated("session-second-desktop".into())
+        );
+    }
+
+    #[test]
+    fn named_display_is_stable_across_restarts() {
+        let named = session("Desktop", Some("Research Window"));
+        assert_eq!(
+            choose_display_assignment(&named, false),
+            DisplayAssignment::Dedicated("research-window".into())
+        );
+    }
+
+    #[test]
+    fn named_display_rejects_a_second_active_session() {
+        let sessions = vec![
+            session("Research", Some("Research Window")),
+            session("Browser", Some("Research Window")),
+        ];
+        assert_eq!(
+            active_display_conflict_index(1, &sessions, [(0, "research-window".into())]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn current_process_is_visible_to_display_worker_liveness_check() {
+        assert!(process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn runtime_lifecycle_commands_use_the_native_cli() {
+        assert_eq!(
+            runtime_container_command("apple", "stop", "desktop"),
+            Some(("container", vec!["stop".into(), "desktop".into()]))
+        );
+        assert_eq!(
+            runtime_container_command("orbstack", "delete", "worker"),
+            Some(("docker", vec!["rm".into(), "-f".into(), "worker".into()]))
+        );
+        assert_eq!(
+            runtime_container_command("docker", "restart", "desktop"),
+            Some(("docker", vec!["restart".into(), "desktop".into()]))
+        );
+    }
+
+    #[test]
+    fn runtime_detail_commands_match_each_cli() {
+        let apple = runtime_detail_commands("container", "desktop").unwrap();
+        assert_eq!(apple.command, "container");
+        assert_eq!(apple.info, vec!["inspect", "desktop"]);
+        assert_eq!(apple.logs, vec!["logs", "-n", "20", "desktop"]);
+        assert!(apple.stats.iter().any(|arg| arg == "--no-stream"));
+
+        let docker = runtime_detail_commands("orbstack", "desktop").unwrap();
+        assert_eq!(docker.command, "docker");
+        assert_eq!(docker.logs, vec!["logs", "--tail", "20", "desktop"]);
+        assert!(docker.stats.iter().any(|arg| arg == "--format"));
+    }
+
+    #[test]
+    fn apple_inspect_json_becomes_a_readable_summary() {
+        let output = br#"[{"configuration":{"id":"desktop","image":{"reference":"example/gui:latest"},"platform":{"os":"linux","architecture":"arm64"},"resources":{"cpus":4,"memoryInBytes":4294967296}},"status":{"state":"running"}}]"#;
+        let summary = apple_inspect_summary(output).unwrap();
+        assert!(summary.iter().any(|line| line == "ID: desktop"));
+        assert!(summary.iter().any(|line| line == "State: running"));
+        assert!(summary.iter().any(|line| line.contains("4.0 GiB")));
+    }
+
+    #[test]
+    fn orbstack_status_parser_distinguishes_stopped_from_running() {
+        assert_eq!(parse_orbstack_running("Running"), Some(true));
+        assert_eq!(parse_orbstack_running("Stopped"), Some(false));
+        assert_eq!(
+            parse_orbstack_running("OrbStack is not running"),
+            Some(false)
+        );
+        assert_eq!(parse_orbstack_running("Unknown"), None);
+    }
+}
+
+fn create_event_handler(
+    target: &ActiveEventLoop,
+) -> impl FnMut(Event<()>, &ActiveEventLoop) + use<> {
+    let display_worker_slot = std::env::var(DISPLAY_WORKER_SLOT_ENV).ok();
+    let display_worker_parent = std::env::var(DISPLAY_WORKER_PARENT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|pid| *pid > 1);
+    let window_title = display_worker_slot
+        .as_ref()
+        .map(|slot| format!("Cocoa-Way - {}", slot))
+        .unwrap_or_else(|| "Cocoa-Way".into());
+    // winit 0.30 requires macOS windows to be created after the first Resumed event.
+    let window_attributes = winit::window::Window::default_attributes()
+        .with_title(window_title)
+        .with_inner_size(winit::dpi::LogicalSize::new(800.0f64, 600.0f64));
+    let window = target
+        .create_window(window_attributes)
         .expect("Failed to create window");
-    let mut renderer = metal_renderer::MetalRenderer::new(window)
-        .expect("Failed to create MetalRenderer");
+    let mut renderer =
+        metal_renderer::MetalRenderer::new(window).expect("Failed to create MetalRenderer");
     info!("MetalRenderer created with Metal hardware rendering");
     let mut display = Display::<AppState>::new().unwrap();
     let display_handle = display.handle();
     let (loop_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
+    let control_socket_path = if display_worker_slot.is_none() {
+        match control_api::start(loop_signal.clone()) {
+            Ok(path) => {
+                log::info!("Local control API listening on {}", path.display());
+                Some(path)
+            }
+            Err(error) => {
+                log::error!("Local control API is unavailable: {}", error);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if display_worker_slot.is_none() {
+        diagnostics::start_resource_sampler();
+    }
     let menu_signal = loop_signal.clone(); // separate sender for the menu bar
     // Use scale=1: clients render at physical pixel resolution (1600x1200).
     // This gives pixel-perfect 1:1 rendering instead of blurry 2x upscale.
     let mut state = AppState::new(
         &display_handle,
-        1.0,   // compositor scale=1: layout in physical pixels
+        1.0, // compositor scale=1: layout in physical pixels
         loop_signal,
         renderer.window.inner_size().width,
         renderer.window.inner_size().height,
     );
     let initial_size = renderer.window.inner_size();
+    let (initial_width, initial_height) = layout::sanitize_logical_size(
+        f64::from(initial_size.width),
+        f64::from(initial_size.height),
+    );
     let initial_mode = smithay::output::Mode {
-        size: (initial_size.width as i32, initial_size.height as i32).into(),
+        size: (initial_width, initial_height).into(),
         refresh: 60_000,
     };
     state.output.change_current_state(
@@ -63,71 +2543,121 @@ fn main() {
         Some((0, 0).into()),
     );
     state.output.set_preferred(initial_mode);
-    let runtime_dir = std::env::temp_dir().join("cocoa-way");
+    let runtime_dir = std::env::var_os(DISPLAY_WORKER_RUNTIME_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("cocoa-way"));
     if !runtime_dir.exists() {
         std::fs::create_dir_all(&runtime_dir).unwrap();
     }
-    unsafe { std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir); }
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
+    }
     let listener = ListeningSocket::bind_auto("wayland", 1..10).unwrap();
     let socket_name = listener
         .socket_name()
         .unwrap()
         .to_string_lossy()
         .into_owned();
-    let socket_path = runtime_dir.join(&socket_name);
     info!("Wayland socket created: {:?}", socket_name);
     info!("XDG_RUNTIME_DIR set to: {:?}", runtime_dir);
     info!(
         "To run clients: export XDG_RUNTIME_DIR={:?} WAYLAND_DISPLAY={}",
         runtime_dir, socket_name
     );
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name); }
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
+    if let Some(ready_file) = std::env::var_os(DISPLAY_WORKER_READY_ENV) {
+        let ready_file = std::path::PathBuf::from(ready_file);
+        let temporary = ready_file.with_extension("tmp");
+        let contents = format!("{}\n{}\n", runtime_dir.display(), socket_name);
+        if let Err(error) = std::fs::write(&temporary, contents)
+            .and_then(|()| std::fs::rename(&temporary, &ready_file))
+        {
+            log::error!("Failed to publish dedicated display readiness: {}", error);
+        }
+    }
     let mut loop_handle = display_handle.clone();
-    std::thread::spawn(move || loop {
-        match listener.accept() {
-            Ok(Some(stream)) => {
-                use crate::state::ClientState;
-                info!("New client connected");
-                loop_handle
-                    .insert_client(
-                        stream,
-                        Arc::new(ClientState {
-                            compositor_state: Default::default(),
-                        }),
-                    )
-                    .unwrap();
-            }
-            Ok(None) => {}
-            Err(_) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+    std::thread::spawn(move || {
+        loop {
+            match listener.accept() {
+                Ok(Some(stream)) => {
+                    use crate::state::ClientState;
+                    info!("New client connected");
+                    loop_handle
+                        .insert_client(
+                            stream,
+                            Arc::new(ClientState {
+                                compositor_state: Default::default(),
+                            }),
+                        )
+                        .unwrap();
+                }
+                Ok(None) => {
+                    // The Wayland listening socket is non-blocking. Without a small
+                    // pause this thread spins at 100% CPU while waiting for clients.
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         }
     });
-    let runtime_dir_str = runtime_dir.to_string_lossy().into_owned();
     let mut hidpi_enabled = false;
 
     // Will be installed in Event::Resumed (after winit's applicationDidFinishLaunching)
     let connections_for_menu = connections::load_connections();
     let container_sessions_for_menu = container_sessions::load_sessions();
-    let mut pending_menu: Option<std::sync::mpsc::Sender<CompositorMessage>> = Some(menu_signal);
+    let container_event_signal = menu_signal.clone();
+    let mut pending_menu: Option<std::sync::mpsc::Sender<CompositorMessage>> =
+        if display_worker_slot.is_some() {
+            None
+        } else {
+            Some(menu_signal)
+        };
+    let mut active_container_sessions: Vec<ActiveContainerSession> = Vec::new();
+    let mut active_classic_connections: Vec<ActiveClassicConnection> = Vec::new();
+    let mut pending_display_sessions: HashMap<usize, String> = HashMap::new();
+    let mut managed_displays: Vec<ManagedDisplay> = Vec::new();
+    let mut pending_managed_displays = std::collections::HashSet::<String>::new();
 
     let mut last_mouse_pos =
         smithay::utils::Point::<f64, smithay::utils::Logical>::from((0.0, 0.0));
     let start_time = std::time::Instant::now();
     let frame_duration = std::time::Duration::from_millis(16); // ~60fps cap
+    let active_poll_interval = std::time::Duration::from_millis(4);
+    let idle_poll_interval = std::time::Duration::from_millis(24);
     let mut last_frame = std::time::Instant::now();
     let mut last_layout_size: (i32, i32) = (0, 0); // track last logical size sent to layout
-    event_loop.run(move |event, target| {
+    let mut last_render_diagnostic = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    let mut blank_render_since: Option<std::time::Instant> = None;
+    let mut perf_window_start = std::time::Instant::now();
+    let mut perf_last_commits = state.commit_counter;
+    let mut perf_last_redraws = 0u64;
+    let mut perf_redraws = 0u64;
+    let mut perf_late_redraws = 0u64;
+    let mut perf_max_redraw_wait_ms = 0.0f64;
+    let mut pending_redraw_since: Option<std::time::Instant> = None;
+    let mut pending_input_sample: Option<(std::time::Instant, u64)> = None;
+    let mut input_to_present_ms: Option<f64> = None;
+    let mut last_parent_check = std::time::Instant::now();
+    move |event, target| {
         while let Ok(msg) = loop_receiver.try_recv() {
             match msg {
+                CompositorMessage::GuestClipboardText(text) => {
+                    state.install_guest_clipboard(text);
+                }
                 CompositorMessage::Maximize(max) => {
                     log::info!("Handling Maximize: {}", max);
                     renderer.window.set_maximized(max);
-                },
+                }
                 CompositorMessage::Fullscreen(full) => {
                     log::info!("Handling Fullscreen: {}", full);
                     if full {
-                        renderer.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                        renderer
+                            .window
+                            .set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                     } else {
                         renderer.window.set_fullscreen(None);
                     }
@@ -144,146 +2674,953 @@ fn main() {
                     state.scale_factor = new_scale;
                     // Advertise new output scale to clients.
                     state.output.change_current_state(
-                        None, None,
+                        None,
+                        None,
                         Some(smithay::output::Scale::Integer(new_scale.round() as i32)),
                         None,
                     );
                     // Recalculate layout for new logical viewport.
-                    let log_w = (state.width as f64 / new_scale) as i32;
-                    let log_h = (state.height as f64 / new_scale) as i32;
+                    let (log_w, log_h) =
+                        layout::logical_size_from_physical(state.width, state.height, new_scale);
                     state.layout.set_view_size(log_w, log_h);
                     // Relayout sends new configure to every client.
                     for tile in state.layout.tiles.iter() {
                         tile.request_size();
                     }
                     renderer.request_redraw();
-                    log::info!("Mode: {} (compositor scale={}, logical={}x{})",
-                        if hidpi_enabled { "HiDPI 2x" } else { "Normal 1x" },
-                        new_scale as i32, log_w, log_h);
+                    log::info!(
+                        "Mode: {} (compositor scale={}, logical={}x{})",
+                        if hidpi_enabled {
+                            "HiDPI 2x"
+                        } else {
+                            "Normal 1x"
+                        },
+                        new_scale as i32,
+                        log_w,
+                        log_h
+                    );
                 }
                 CompositorMessage::Connect(i) => {
                     log::info!("Connecting to machine #{}", i);
                     if let Some(conn) = connections::load_connections().get(i) {
                         let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
                         let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-                        connections::spawn_waypipe(conn, &rt, &disp);
+                        if let Err(error) = start_classic_connection(
+                            conn,
+                            &rt,
+                            &disp,
+                            &mut active_classic_connections,
+                        ) {
+                            log::error!("Connection '{}' failed: {}", conn.name, error);
+                            let mtm =
+                                unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
+                            menu_bar::show_connection_error(&error, mtm);
+                        }
+                    }
+                }
+                CompositorMessage::ConnectMachine(conn) => {
+                    log::info!("Connecting to machine '{}'", conn.name);
+                    let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+                    let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+                    if let Err(error) =
+                        start_classic_connection(&conn, &rt, &disp, &mut active_classic_connections)
+                    {
+                        log::error!("Connection '{}' failed: {}", conn.name, error);
+                        let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
+                        menu_bar::show_connection_error(&error, mtm);
+                    }
+                }
+                CompositorMessage::ReloadMenu => {
+                    let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
+                    menu_bar::setup_menu(
+                        &connections::load_connections(),
+                        &container_sessions::load_sessions(),
+                        container_event_signal.clone(),
+                        mtm,
+                    );
+                    log::info!("macOS menu bar reloaded");
+                }
+                CompositorMessage::DisconnectClassicConnections => {
+                    log::info!(
+                        "Disconnecting {} classic waypipe connection(s)",
+                        active_classic_connections.len()
+                    );
+                    for mut connection in active_classic_connections.drain(..) {
+                        let _ = connection.child.kill();
+                        let _ = connection.child.wait();
+                    }
+                }
+                CompositorMessage::CheckContainerSession(i) => {
+                    log::info!("Checking container session #{}", i);
+                    if let Some(session) = container_sessions::load_sessions().get(i) {
+                        match container_sessions::check_session(session) {
+                            Ok(report) => container_mode::record_check_success(i, &report),
+                            Err(error) => {
+                                if error.is_apple_container_transport_blocked() {
+                                    log::info!("Container session #{} is blocked: {}", i, error);
+                                } else {
+                                    log::warn!("Container session #{} check failed: {}", i, error);
+                                }
+                                container_mode::record_check_failure(i, &error);
+                            }
+                        }
                     }
                 }
                 CompositorMessage::StartContainerSession(i) => {
                     log::info!("Starting container session #{}", i);
-                    if let Some(session) = container_sessions::load_sessions().get(i) {
-                        let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-                        let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-                        container_sessions::spawn_session(session, &rt, &disp);
+                    let sessions = container_sessions::load_sessions();
+                    if let Some(session) = sessions.get(i) {
+                        reap_exited_container_sessions(&mut active_container_sessions);
+                        sync_active_container_sessions(&active_container_sessions);
+                        if pending_display_sessions.contains_key(&i) {
+                            log::info!(
+                                "Container session #{} launch ignored because its display is still starting",
+                                i
+                            );
+                            continue;
+                        }
+                        if active_container_sessions
+                            .iter()
+                            .any(|active| active.index == i)
+                        {
+                            log::info!(
+                                "Container session #{} launch ignored because it is already tracked as running",
+                                i
+                            );
+                            container_mode::record_launch_already_running(i);
+                            continue;
+                        }
+                        if let Some(conflict_index) = active_display_conflict_index(
+                            i,
+                            &sessions,
+                            active_container_sessions
+                                .iter()
+                                .map(|active| (active.index, active.display_slot.clone()))
+                                .chain(
+                                    pending_display_sessions
+                                        .iter()
+                                        .map(|(index, slot)| (*index, slot.clone())),
+                                ),
+                        ) {
+                            let conflict_name = sessions
+                                .get(conflict_index)
+                                .map(|session| session.name.as_str())
+                                .unwrap_or("another session");
+                            let message = format!(
+                                "The requested display is already used by '{}'. Stop that session or choose another display before launching.",
+                                conflict_name
+                            );
+                            log::warn!("Container session #{} launch blocked: {}", i, message);
+                            container_mode::record_launch_blocked(i, &message);
+                            continue;
+                        }
+                        let default_in_use = active_container_sessions
+                            .iter()
+                            .any(|active| active.display_slot == "default");
+                        let assignment = choose_display_assignment(session, default_in_use);
+                        match assignment {
+                            DisplayAssignment::Default => launch_container_session_on_display(
+                                i,
+                                session,
+                                &std::env::var("XDG_RUNTIME_DIR").unwrap_or_default(),
+                                &std::env::var("WAYLAND_DISPLAY").unwrap_or_default(),
+                                "default".into(),
+                                None,
+                                &container_event_signal,
+                                &mut active_container_sessions,
+                            ),
+                            DisplayAssignment::Dedicated(slot) => {
+                                if pending_managed_displays.contains(&slot) {
+                                    let message = format!(
+                                        "Managed display '{}' is still starting. Wait for it to become ready, then launch this session again.",
+                                        slot
+                                    );
+                                    container_mode::record_launch_blocked(i, &message);
+                                } else if let Some(managed) =
+                                    managed_displays.iter().find(|display| display.slot == slot)
+                                {
+                                    launch_container_session_on_display(
+                                        i,
+                                        session,
+                                        &managed.runtime_dir,
+                                        &managed.display,
+                                        slot,
+                                        None,
+                                        &container_event_signal,
+                                        &mut active_container_sessions,
+                                    );
+                                } else {
+                                    pending_display_sessions.insert(i, slot.clone());
+                                    spawn_display_worker_async(
+                                        i,
+                                        slot,
+                                        container_event_signal.clone(),
+                                    );
+                                }
+                            }
+                        }
                     }
+                }
+                CompositorMessage::DedicatedDisplayStarted {
+                    index,
+                    display_slot,
+                    runtime_dir,
+                    display,
+                    worker_child,
+                    worker_runtime_dir,
+                } => {
+                    let mut display_worker = DisplayWorker {
+                        child: worker_child,
+                        runtime_dir: worker_runtime_dir,
+                    };
+                    let expected_slot = pending_display_sessions.remove(&index);
+                    if expected_slot.as_deref() != Some(display_slot.as_str()) {
+                        log::info!(
+                            "Discarding dedicated display '{}' for cancelled session #{}",
+                            display_slot,
+                            index
+                        );
+                        let _ = terminate_display_worker(&mut display_worker);
+                        continue;
+                    }
+
+                    reap_exited_container_sessions(&mut active_container_sessions);
+                    sync_active_container_sessions(&active_container_sessions);
+                    if active_container_sessions
+                        .iter()
+                        .any(|active| active.index == index)
+                    {
+                        let _ = terminate_display_worker(&mut display_worker);
+                        container_mode::record_launch_already_running(index);
+                        continue;
+                    }
+                    if let Some(conflict) = active_container_sessions
+                        .iter()
+                        .find(|active| active.display_slot == display_slot)
+                    {
+                        let sessions = container_sessions::load_sessions();
+                        let conflict_name = sessions
+                            .get(conflict.index)
+                            .map(|session| session.name.as_str())
+                            .unwrap_or("another session");
+                        let message = format!(
+                            "The dedicated display '{}' became occupied by '{}'. Stop that session or launch again with another display.",
+                            display_slot, conflict_name
+                        );
+                        let _ = terminate_display_worker(&mut display_worker);
+                        container_mode::record_launch_blocked(index, &message);
+                        continue;
+                    }
+
+                    let sessions = container_sessions::load_sessions();
+                    let Some(session) = sessions.get(index) else {
+                        let _ = terminate_display_worker(&mut display_worker);
+                        continue;
+                    };
+                    launch_container_session_on_display(
+                        index,
+                        session,
+                        &runtime_dir,
+                        &display,
+                        display_slot,
+                        Some(display_worker),
+                        &container_event_signal,
+                        &mut active_container_sessions,
+                    );
+                }
+                CompositorMessage::DedicatedDisplayFailed {
+                    index,
+                    display_slot,
+                    error,
+                } => {
+                    if pending_display_sessions.get(&index).map(String::as_str)
+                        != Some(display_slot.as_str())
+                    {
+                        continue;
+                    }
+                    pending_display_sessions.remove(&index);
+                    log::error!(
+                        "Container session #{} dedicated display '{}' failed: {}",
+                        index,
+                        display_slot,
+                        error
+                    );
+                    container_mode::record_launch_blocked(index, &error);
+                }
+                CompositorMessage::CreateManagedDisplay => {
+                    reap_exited_managed_displays(
+                        &mut managed_displays,
+                        &mut active_container_sessions,
+                    );
+                    let slot = next_managed_display_slot(
+                        &managed_displays,
+                        &pending_managed_displays,
+                        &active_container_sessions,
+                    );
+                    pending_managed_displays.insert(slot.clone());
+                    container_mode::record_managed_display_starting(&slot);
+                    spawn_managed_display_worker_async(slot, container_event_signal.clone());
+                }
+                CompositorMessage::ManagedDisplayStarted {
+                    display_slot,
+                    runtime_dir,
+                    display,
+                    worker_child,
+                    worker_runtime_dir,
+                } => {
+                    let mut worker = DisplayWorker {
+                        child: worker_child,
+                        runtime_dir: worker_runtime_dir,
+                    };
+                    if !pending_managed_displays.remove(&display_slot) {
+                        let _ = terminate_display_worker(&mut worker);
+                        continue;
+                    }
+                    if managed_displays
+                        .iter()
+                        .any(|managed| managed.slot == display_slot)
+                        || active_container_sessions
+                            .iter()
+                            .any(|active| active.display_slot == display_slot)
+                    {
+                        let message = format!(
+                            "Display slot '{}' became occupied while the managed window was starting.",
+                            display_slot
+                        );
+                        let _ = terminate_display_worker(&mut worker);
+                        container_mode::record_managed_display_failure(&display_slot, &message);
+                        continue;
+                    }
+                    log::info!(
+                        "Managed display '{}' is ready at {}/{}",
+                        display_slot,
+                        runtime_dir,
+                        display
+                    );
+                    managed_displays.push(ManagedDisplay {
+                        slot: display_slot,
+                        runtime_dir,
+                        display,
+                        worker,
+                    });
+                    sync_managed_displays(&managed_displays);
+                }
+                CompositorMessage::ManagedDisplayFailed {
+                    display_slot,
+                    error,
+                } => {
+                    if pending_managed_displays.remove(&display_slot) {
+                        log::error!(
+                            "Managed display '{}' failed to start: {}",
+                            display_slot,
+                            error
+                        );
+                        container_mode::record_managed_display_failure(&display_slot, &error);
+                    }
+                }
+                CompositorMessage::CloseManagedDisplay(display_slot) => {
+                    if let Some(active) = active_container_sessions
+                        .iter()
+                        .find(|active| active.display_slot == display_slot)
+                    {
+                        let sessions = container_sessions::load_sessions();
+                        let session_name = sessions
+                            .get(active.index)
+                            .map(|session| session.name.as_str())
+                            .unwrap_or("a GUI session");
+                        let message = format!(
+                            "Managed display '{}' is still used by '{}'. Stop the session before closing the display.",
+                            display_slot, session_name
+                        );
+                        container_mode::record_managed_display_failure(&display_slot, &message);
+                        continue;
+                    }
+                    if pending_managed_displays.remove(&display_slot) {
+                        container_mode::record_managed_display_exit(
+                            &display_slot,
+                            "startup cancelled",
+                        );
+                        continue;
+                    }
+                    let Some(position) = managed_displays
+                        .iter()
+                        .position(|managed| managed.slot == display_slot)
+                    else {
+                        container_mode::record_managed_display_failure(
+                            &display_slot,
+                            "Display no longer exists.",
+                        );
+                        continue;
+                    };
+                    let mut managed = managed_displays.remove(position);
+                    match terminate_display_worker(&mut managed.worker) {
+                        Ok(()) => container_mode::record_managed_display_exit(
+                            &display_slot,
+                            "closed by user",
+                        ),
+                        Err(error) => container_mode::record_managed_display_failure(
+                            &display_slot,
+                            &format!("Failed to close display: {}", error),
+                        ),
+                    }
+                    sync_managed_displays(&managed_displays);
+                }
+                CompositorMessage::StopContainerSession(i) => {
+                    log::info!("Stopping container session #{}", i);
+                    if pending_display_sessions.remove(&i).is_some() {
+                        cleanup_named_container_session(i);
+                        container_mode::record_stop_success(i);
+                        continue;
+                    }
+                    match stop_active_container_session(&mut active_container_sessions, i) {
+                        Ok(()) => {
+                            sync_active_container_sessions(&active_container_sessions);
+                            cleanup_named_container_session(i);
+                            container_mode::record_stop_success(i)
+                        }
+                        Err(tracked_error) => {
+                            sync_active_container_sessions(&active_container_sessions);
+                            if let Some(session) = container_sessions::load_sessions().get(i) {
+                                match container_sessions::cleanup_named_session(session) {
+                                    Ok(()) => container_mode::record_stop_success(i),
+                                    Err(named_error) => {
+                                        let error = format!(
+                                            "{}; named cleanup failed: {}",
+                                            tracked_error, named_error
+                                        );
+                                        log::warn!(
+                                            "Container session #{} stop failed: {}",
+                                            i,
+                                            error
+                                        );
+                                        container_mode::record_stop_failure(i, &error);
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "Container session #{} stop failed: {}",
+                                    i,
+                                    tracked_error
+                                );
+                                container_mode::record_stop_failure(i, &tracked_error);
+                            }
+                        }
+                    }
+                }
+                CompositorMessage::OpenContainerTerminal(i) => {
+                    log::info!("Opening terminal for container session #{}", i);
+                    match open_container_terminal(i) {
+                        Ok(()) => container_mode::record_terminal_opened(i),
+                        Err(error) => {
+                            log::warn!(
+                                "Opening terminal for container session #{} failed: {}",
+                                i,
+                                error
+                            );
+                            container_mode::record_terminal_open_failed(i, &error);
+                        }
+                    }
+                }
+                CompositorMessage::ContainerSessionLog {
+                    index,
+                    source,
+                    line,
+                } => {
+                    container_mode::record_session_log(index, &source, &line);
+                }
+                CompositorMessage::PullContainerImage {
+                    runtime,
+                    image,
+                    platform,
+                    scheme,
+                    configure_session,
+                } => match diagnostics::ensure_storage_growth_allowed() {
+                    Ok(_) => {
+                        container_mode::record_image_pull_started(
+                            &runtime,
+                            &image,
+                            configure_session,
+                        );
+                        spawn_image_pull(
+                            container_event_signal.clone(),
+                            runtime,
+                            image,
+                            platform,
+                            scheme,
+                        );
+                    }
+                    Err(error) => {
+                        container_mode::record_storage_growth_blocked("pull an image", &error)
+                    }
+                },
+                CompositorMessage::LoginContainerRegistry {
+                    server,
+                    username,
+                    password,
+                    scheme,
+                } => {
+                    let action = format!("registry login {}", server);
+                    container_mode::record_runtime_system_action_started("apple", &action);
+                    spawn_registry_login(
+                        container_event_signal.clone(),
+                        server,
+                        username,
+                        password,
+                        scheme,
+                    );
+                }
+                CompositorMessage::LoadContainerImage { path } => {
+                    match diagnostics::ensure_storage_growth_allowed() {
+                        Ok(_) => {
+                            container_mode::record_image_load_started(&path);
+                            spawn_image_load(container_event_signal.clone(), path);
+                        }
+                        Err(error) => container_mode::record_storage_growth_blocked(
+                            "load an OCI archive",
+                            &error,
+                        ),
+                    }
+                }
+                CompositorMessage::BuildContainerImage {
+                    image,
+                    containerfile,
+                    context,
+                } => match diagnostics::ensure_storage_growth_allowed() {
+                    Ok(_) => {
+                        container_mode::record_image_build_started(&image, &containerfile);
+                        spawn_image_build(
+                            container_event_signal.clone(),
+                            image,
+                            containerfile,
+                            context,
+                        );
+                    }
+                    Err(error) => {
+                        container_mode::record_storage_growth_blocked("build an image", &error)
+                    }
+                },
+                CompositorMessage::StartAppleContainerSystem => {
+                    container_mode::record_apple_container_system_start_started();
+                    spawn_apple_container_system_start(container_event_signal.clone());
+                }
+                CompositorMessage::DeleteContainerImage { runtime, image } => {
+                    container_mode::record_image_delete_started(&runtime, &image);
+                    spawn_image_delete(container_event_signal.clone(), runtime, image);
+                }
+                CompositorMessage::DeleteContainerVolume { runtime, volume } => {
+                    container_mode::record_volume_delete_started(&runtime, &volume);
+                    spawn_volume_delete(container_event_signal.clone(), runtime, volume);
+                }
+                CompositorMessage::CreateContainerVolume { runtime, volume } => {
+                    container_mode::record_volume_create_started(&runtime, &volume);
+                    spawn_volume_create(container_event_signal.clone(), runtime, volume);
+                }
+                CompositorMessage::StopRuntimeContainer { runtime, name } => {
+                    container_mode::record_runtime_container_action_started(
+                        &runtime, &name, "stop",
+                    );
+                    spawn_runtime_container_action(
+                        container_event_signal.clone(),
+                        runtime,
+                        name,
+                        "stop".into(),
+                    );
+                }
+                CompositorMessage::StartRuntimeContainer { runtime, name } => {
+                    container_mode::record_runtime_container_action_started(
+                        &runtime, &name, "start",
+                    );
+                    spawn_runtime_container_action(
+                        container_event_signal.clone(),
+                        runtime,
+                        name,
+                        "start".into(),
+                    );
+                }
+                CompositorMessage::RestartRuntimeContainer { runtime, name } => {
+                    container_mode::record_runtime_container_action_started(
+                        &runtime, &name, "restart",
+                    );
+                    spawn_runtime_container_action(
+                        container_event_signal.clone(),
+                        runtime,
+                        name,
+                        "restart".into(),
+                    );
+                }
+                CompositorMessage::DeleteRuntimeContainer { runtime, name } => {
+                    container_mode::record_runtime_container_action_started(
+                        &runtime, &name, "delete",
+                    );
+                    spawn_runtime_container_action(
+                        container_event_signal.clone(),
+                        runtime,
+                        name,
+                        "delete".into(),
+                    );
+                }
+                CompositorMessage::OpenRuntimeContainerTerminal { runtime, name } => {
+                    match open_runtime_container_terminal(&runtime, &name) {
+                        Ok(()) => container_mode::record_runtime_container_terminal_opened(
+                            &runtime, &name,
+                        ),
+                        Err(error) => container_mode::record_runtime_container_terminal_failed(
+                            &runtime, &name, &error,
+                        ),
+                    }
+                }
+                CompositorMessage::RefreshRuntimeContainerDetails { runtime, name } => {
+                    spawn_runtime_container_details(container_event_signal.clone(), runtime, name);
+                }
+                CompositorMessage::RuntimeSystemAction { runtime, action } => {
+                    container_mode::record_runtime_system_action_started(&runtime, &action);
+                    spawn_runtime_system_action(container_event_signal.clone(), runtime, action);
+                }
+                CompositorMessage::UseDockerContext { name } => {
+                    let action = format!("context use {}", name);
+                    container_mode::record_runtime_system_action_started("docker", &action);
+                    spawn_docker_context_switch(container_event_signal.clone(), name);
+                }
+                CompositorMessage::ContainerImagePullLog {
+                    runtime,
+                    image,
+                    line,
+                } => {
+                    if runtime == "load" {
+                        container_mode::record_image_load_log(&image, &line);
+                    } else if runtime == "build" {
+                        container_mode::record_image_build_log(&image, &line);
+                    } else if runtime == "system" {
+                        container_mode::record_apple_container_system_start_log(&line);
+                    } else if runtime == "delete" {
+                        container_mode::record_image_delete_log(&runtime, &image, &line);
+                    } else {
+                        container_mode::record_image_pull_log(&runtime, &image, &line);
+                    }
+                }
+                CompositorMessage::ContainerImagePullFinished {
+                    runtime,
+                    image,
+                    success,
+                    status,
+                } => {
+                    if runtime == "load" {
+                        container_mode::record_image_load_finished(&image, success, &status);
+                    } else if runtime == "build" {
+                        container_mode::record_image_build_finished(&image, success, &status);
+                    } else if runtime == "system" {
+                        container_mode::record_apple_container_system_start_finished(
+                            success, &status,
+                        );
+                    } else if runtime == "delete" {
+                        container_mode::record_image_delete_finished(
+                            &runtime, &image, success, &status,
+                        );
+                    } else {
+                        container_mode::record_image_pull_finished(
+                            &runtime, &image, success, &status,
+                        );
+                    }
+                }
+                CompositorMessage::ContainerVolumeDeleteLog {
+                    runtime,
+                    volume,
+                    line,
+                } => {
+                    container_mode::record_volume_delete_log(&runtime, &volume, &line);
+                }
+                CompositorMessage::ContainerVolumeDeleteFinished {
+                    runtime,
+                    volume,
+                    success,
+                    status,
+                } => {
+                    container_mode::record_volume_delete_finished(
+                        &runtime, &volume, success, &status,
+                    );
+                }
+                CompositorMessage::ContainerVolumeCreateLog {
+                    runtime,
+                    volume,
+                    line,
+                } => {
+                    container_mode::record_volume_create_log(&runtime, &volume, &line);
+                }
+                CompositorMessage::ContainerVolumeCreateFinished {
+                    runtime,
+                    volume,
+                    success,
+                    status,
+                } => {
+                    container_mode::record_volume_create_finished(
+                        &runtime, &volume, success, &status,
+                    );
+                }
+                CompositorMessage::RuntimeContainerActionLog {
+                    runtime,
+                    name,
+                    action,
+                    line,
+                } => {
+                    container_mode::record_runtime_container_action_log(
+                        &runtime, &name, &action, &line,
+                    );
+                }
+                CompositorMessage::RuntimeContainerActionFinished {
+                    runtime,
+                    name,
+                    action,
+                    success,
+                    status,
+                } => {
+                    container_mode::record_runtime_container_action_finished(
+                        &runtime, &name, &action, success, &status,
+                    );
+                }
+                CompositorMessage::RuntimeContainerDetailsLoaded {
+                    runtime,
+                    name,
+                    info,
+                    logs,
+                    stats,
+                    error,
+                } => {
+                    container_mode::record_runtime_container_details_loaded(
+                        &runtime, &name, info, logs, stats, error,
+                    );
+                }
+                CompositorMessage::RuntimeSystemActionLog {
+                    runtime,
+                    action,
+                    line,
+                } => {
+                    container_mode::record_runtime_system_action_log(&runtime, &action, &line);
+                }
+                CompositorMessage::RuntimeSystemActionFinished {
+                    runtime,
+                    action,
+                    success,
+                    status,
+                } => {
+                    container_mode::record_runtime_system_action_finished(
+                        &runtime, &action, success, &status,
+                    );
                 }
             }
         }
         match event {
             Event::WindowEvent { window_id, event } if window_id == renderer.window.id() => {
                 match event {
-                     WindowEvent::Resized(size) => {
-                         println!("*** HIT RESIZED EVENT: {}x{} ***", size.width, size.height);
-                         let width = size.width as i32;
-                         let height = size.height as i32;
-                         renderer.resize(size.width, size.height);
-                         state.width = size.width;
-                         state.height = size.height;
-                         // Preserve whatever scale mode was active (HiDPI or normal).
-                         let cur_scale = state.scale_factor;
-                         let mode = smithay::output::Mode {
-                             size: (width, height).into(),
-                             refresh: 60_000,
-                         };
-                         state.output.change_current_state(
-                             Some(mode),
-                             Some(smithay::utils::Transform::Normal),
-                             Some(smithay::output::Scale::Integer(cur_scale.round() as i32)),
-                             Some((0,0).into())
-                         );
-                         // Recalculate layout and tell all clients their new size.
-                         let log_w = (width as f64 / cur_scale) as i32;
-                         let log_h = (height as f64 / cur_scale) as i32;
-                         state.layout.set_view_size(log_w, log_h);
-                         for tile in state.layout.tiles.iter() {
-                             tile.request_size();
-                         }
-                     },
+                    WindowEvent::Resized(size) => {
+                        println!("*** HIT RESIZED EVENT: {}x{} ***", size.width, size.height);
+                        renderer.resize(size.width, size.height);
+                        state.width = size.width;
+                        state.height = size.height;
+                        // Preserve whatever scale mode was active (HiDPI or normal).
+                        let cur_scale = state.scale_factor;
+                        let (width, height) = layout::sanitize_logical_size(
+                            f64::from(size.width),
+                            f64::from(size.height),
+                        );
+                        if (width as u32, height as u32) != (size.width, size.height) {
+                            log::warn!(
+                                "Window reported unsafe output size {}x{}; advertising {}x{} to Wayland clients",
+                                size.width,
+                                size.height,
+                                width,
+                                height
+                            );
+                        }
+                        let mode = smithay::output::Mode {
+                            size: (width, height).into(),
+                            refresh: 60_000,
+                        };
+                        state.output.change_current_state(
+                            Some(mode),
+                            Some(smithay::utils::Transform::Normal),
+                            Some(smithay::output::Scale::Integer(cur_scale.round() as i32)),
+                            Some((0, 0).into()),
+                        );
+                        // Recalculate layout and tell all clients their new size.
+                        let (log_w, log_h) =
+                            layout::logical_size_from_physical(size.width, size.height, cur_scale);
+                        state.layout.set_view_size(log_w, log_h);
+                        for tile in state.layout.tiles.iter() {
+                            tile.request_size();
+                        }
+                        state.needs_redraw = true;
+                    }
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         log::info!("ScaleFactorChanged: {}", scale_factor);
                         state.update_scale_factor(scale_factor);
                         renderer.set_scale_factor(scale_factor);
-                    },
+                        state.needs_redraw = true;
+                    }
                     WindowEvent::CloseRequested => target.exit(),
-                    WindowEvent::KeyboardInput { event: KeyEvent { state: el_state, physical_key, .. }, .. } => {
+                    WindowEvent::CursorEntered { .. } => {
+                        if !state.layout.tiles.is_empty() {
+                            renderer.window.set_cursor_visible(false);
+                        }
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        renderer.window.set_cursor_visible(true);
+                    }
+                    WindowEvent::Focused(false) => {
+                        if let Some(keyboard) = state.seat.get_keyboard() {
+                            let pressed_keys = keyboard.pressed_keys();
+                            if !pressed_keys.is_empty() {
+                                log::info!(
+                                    "Releasing {} held key(s) after the Cocoa-Way window lost focus",
+                                    pressed_keys.len()
+                                );
+                            }
+                            for keycode in pressed_keys {
+                                keyboard.input(
+                                    &mut state,
+                                    keycode,
+                                    smithay::backend::input::KeyState::Released,
+                                    SERIAL_COUNTER.next_serial(),
+                                    start_time.elapsed().as_millis() as u32,
+                                    |_, _, _| FilterResult::<()>::Forward,
+                                );
+                            }
+                        }
+                    }
+                    WindowEvent::Focused(true) => {}
+                    WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                state: el_state,
+                                physical_key,
+                                ..
+                            },
+                        ..
+                    } => {
+                        if pending_input_sample.is_none() {
+                            pending_input_sample =
+                                Some((std::time::Instant::now(), state.commit_counter));
+                        }
                         if let winit::keyboard::PhysicalKey::Code(key_code) = physical_key {
                             match key_code {
                                 _ => {
-                                     use smithay::backend::input::KeyState;
-                                     use smithay::input::keyboard::Keycode;  
-                                     let serial = SERIAL_COUNTER.next_serial();
-                                     let time = start_time.elapsed().as_millis() as u32;
-                                     if let Some(keyboard) = state.seat.get_keyboard() {
-                                         if let Some(scancode) = crate::keymap::map_key(physical_key) {
-                                             let key_state = match el_state {
-                                                 ElementState::Pressed => KeyState::Pressed,
-                                                 ElementState::Released => KeyState::Released,
-                                             };
-                                             let keycode = Keycode::from(scancode + 8);
-                                             keyboard.input(&mut state, keycode, key_state, serial, time, |_, _, _| FilterResult::<()>::Forward);
-                                         }
-                                     }
+                                    use smithay::backend::input::KeyState;
+                                    use smithay::input::keyboard::Keycode;
+                                    let serial = SERIAL_COUNTER.next_serial();
+                                    let time = start_time.elapsed().as_millis() as u32;
+                                    if let Some(keyboard) = state.seat.get_keyboard() {
+                                        if let Some(scancode) = crate::keymap::map_key(physical_key)
+                                        {
+                                            let key_state = match el_state {
+                                                ElementState::Pressed => KeyState::Pressed,
+                                                ElementState::Released => KeyState::Released,
+                                            };
+                                            let keycode = Keycode::from(scancode + 8);
+                                            keyboard.input(
+                                                &mut state,
+                                                keycode,
+                                                key_state,
+                                                serial,
+                                                time,
+                                                |_, modifiers, _| {
+                                                    if el_state == ElementState::Pressed
+                                                        && matches!(
+                                                            key_code,
+                                                            winit::keyboard::KeyCode::KeyC
+                                                                | winit::keyboard::KeyCode::KeyV
+                                                        )
+                                                        && modifiers.ctrl
+                                                        && modifiers.shift
+                                                    {
+                                                        log::info!(
+                                                            "Forwarding Ctrl+Shift+{:?} to the focused Wayland client",
+                                                            key_code
+                                                        );
+                                                    }
+                                                    FilterResult::<()>::Forward
+                                                },
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
-                    },
+                    }
                     WindowEvent::CursorMoved { position, .. } => {
+                        if pending_input_sample.is_none() {
+                            pending_input_sample =
+                                Some((std::time::Instant::now(), state.commit_counter));
+                        }
                         let scale = state.scale_factor;
                         let logical_pos = position.to_logical::<f64>(scale);
-                        log::debug!("CursorMoved: Physical({:?}) -> Logical({:?})", position, logical_pos);
+                        log::debug!(
+                            "CursorMoved: Physical({:?}) -> Logical({:?})",
+                            position,
+                            logical_pos
+                        );
                         let serial = SERIAL_COUNTER.next_serial();
                         let pointer = state.seat.get_pointer().unwrap();
-                        let position_f64 = smithay::utils::Point::<f64, smithay::utils::Logical>::from((logical_pos.x, logical_pos.y));
-                         if let Some(target_id) = state.start_drag_request.take() {
-                              let (cur_x, cur_y) = state.layout.tile_for_surface(&target_id)
-                                  .map(|t| (t.position.x, t.position.y))
-                                  .unwrap_or((0, 0));
-                              let offset_x = logical_pos.x - cur_x as f64;
-                              let offset_y = logical_pos.y - cur_y as f64;
-                              state.drag_state = Some((target_id.clone(), (offset_x, offset_y)));
-                              log::info!("Drag Started for {:?}", target_id);
-                         }
+                        let cursor_logical_point =
+                            smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                                logical_pos.x,
+                                logical_pos.y,
+                            ));
+                        let delta = cursor_logical_point - last_mouse_pos;
+                        if !state.layout.tiles.is_empty() {
+                            renderer.window.set_cursor_visible(false);
+                        }
+                        if let Some(target_id) = state.start_drag_request.take() {
+                            let (cur_x, cur_y) = state
+                                .layout
+                                .tile_for_surface(&target_id)
+                                .map(|t| (t.position.x, t.position.y))
+                                .unwrap_or((0, 0));
+                            let offset_x = logical_pos.x - cur_x as f64;
+                            let offset_y = logical_pos.y - cur_y as f64;
+                            state.drag_state = Some((target_id.clone(), (offset_x, offset_y)));
+                            log::info!("Drag Started for {:?}", target_id);
+                        }
                         if let Some((target_id, (offset_x, offset_y))) = state.drag_state.clone() {
                             let new_x = (logical_pos.x - offset_x) as i32;
                             let new_y = (logical_pos.y - offset_y) as i32;
                             state.layout.move_tile(&target_id, new_x, new_y);
+                            state.needs_redraw = true;
                             renderer.request_redraw();
                         }
                         let mut focus = None;
-                         let cursor_logical_point = smithay::utils::Point::<f64, smithay::utils::Logical>::from((logical_pos.x, logical_pos.y));
-                         last_mouse_pos = cursor_logical_point;
-                         for tile in state.layout.tiles.iter().rev() {
-                             let tile_x = tile.position.x as f64;
-                             let tile_y = tile.position.y as f64;
-                             let tile_w = tile.size.w as f64;
-                             let tile_h = tile.size.h as f64;
-                             if logical_pos.x >= tile_x && logical_pos.x < tile_x + tile_w
-                                && logical_pos.y >= tile_y && logical_pos.y < tile_y + tile_h {
-                                 let wl_surface = tile.toplevel.wl_surface();
-                                 let surface_location = smithay::utils::Point::<f64, smithay::utils::Logical>::from(
-                                     (tile_x, tile_y)
-                                 );
-                                 log::debug!("HitTest: FOUND tile {:?} at logical ({:.0}, {:.0})", wl_surface.id(), tile_x, tile_y);
-                                 focus = Some((wl_surface.clone(), surface_location));
-                                 break;
-                             }
-                         }
-                         if focus.is_none() && !state.layout.tiles.is_empty() {
-                             log::debug!("HitTest: cursor at ({:.0}, {:.0}) not in any tile", logical_pos.x, logical_pos.y);
-                         }
-                         let time = start_time.elapsed().as_millis() as u32;
+                        for tile in state.layout.tiles.iter().rev() {
+                            let tile_x = tile.position.x as f64;
+                            let tile_y = tile.position.y as f64;
+                            let tile_w = tile.size.w as f64;
+                            let tile_h = tile.size.h as f64;
+                            if logical_pos.x >= tile_x
+                                && logical_pos.x < tile_x + tile_w
+                                && logical_pos.y >= tile_y
+                                && logical_pos.y < tile_y + tile_h
+                            {
+                                let wl_surface = tile.toplevel.wl_surface();
+                                let surface_location =
+                                    smithay::utils::Point::<f64, smithay::utils::Logical>::from((
+                                        tile_x, tile_y,
+                                    ));
+                                log::debug!(
+                                    "HitTest: FOUND tile {:?} at logical ({:.0}, {:.0})",
+                                    wl_surface.id(),
+                                    tile_x,
+                                    tile_y
+                                );
+                                focus = Some((wl_surface.clone(), surface_location));
+                                break;
+                            }
+                        }
+                        if focus.is_none() && !state.layout.tiles.is_empty() {
+                            log::debug!(
+                                "HitTest: cursor at ({:.0}, {:.0}) not in any tile",
+                                logical_pos.x,
+                                logical_pos.y
+                            );
+                        }
+                        let time = start_time.elapsed().as_millis() as u32;
                         // Send relative motion if the focused surface has an active lock constraint.
-                        let delta = position_f64 - last_mouse_pos;
                         let is_locked = focus.as_ref().map(|(surface, _)| {
                             smithay::wayland::pointer_constraints::with_pointer_constraint::<crate::state::AppState, _, _>(
                                 surface,
@@ -315,24 +3652,38 @@ fn main() {
                             pointer.motion(&mut state, focus, &event);
                         }
                         pointer.frame(&mut state);
-                    },
-                    WindowEvent::MouseInput { state: el_state, button, .. } => {
+                        last_mouse_pos = cursor_logical_point;
+                        let _ = display.flush_clients();
+                    }
+                    WindowEvent::MouseInput {
+                        state: el_state,
+                        button,
+                        ..
+                    } => {
+                        if pending_input_sample.is_none() {
+                            pending_input_sample =
+                                Some((std::time::Instant::now(), state.commit_counter));
+                        }
                         log::info!("MouseInput: {:?} {:?}", button, el_state);
                         let serial = SERIAL_COUNTER.next_serial();
                         let pointer = state.seat.get_pointer().unwrap();
                         let keyboard = state.seat.get_keyboard().unwrap();
                         let button_code = match button {
-                            winit::event::MouseButton::Left => 0x110,  
+                            winit::event::MouseButton::Left => 0x110,
                             winit::event::MouseButton::Right => 0x111,
                             winit::event::MouseButton::Middle => 0x112,
                             _ => 0x110,
                         };
-                         let p_state = match el_state {
+                        let p_state = match el_state {
                             ElementState::Pressed => smithay::backend::input::ButtonState::Pressed,
-                            ElementState::Released => smithay::backend::input::ButtonState::Released,
+                            ElementState::Released => {
+                                smithay::backend::input::ButtonState::Released
+                            }
                         };
                         let time = start_time.elapsed().as_millis() as u32;
-                        if p_state == smithay::backend::input::ButtonState::Pressed && button == winit::event::MouseButton::Left {
+                        if p_state == smithay::backend::input::ButtonState::Pressed
+                            && button == winit::event::MouseButton::Left
+                        {
                             let mut focus_surface = None;
                             if let Some(pointer_state) = state.seat.get_pointer() {
                                 if let Some(surface) = pointer_state.current_focus() {
@@ -340,30 +3691,44 @@ fn main() {
                                 }
                             }
                             if let Some(surface) = focus_surface {
-                                log::info!("Click-Focus: Setting keyboard focus to {:?}", surface.id());
+                                log::info!(
+                                    "Click-Focus: Setting keyboard focus to {:?}",
+                                    surface.id()
+                                );
                                 keyboard.set_focus(&mut state, Some(surface.clone()), serial);
-                                if let Some(toplevel) = state.toplevels.iter().find(|t| t.wl_surface() == &surface) {
-                                     toplevel.with_pending_state(|state| {
-                                        state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
-                                    });
+                                if let Some(toplevel) =
+                                    state.toplevels.iter().find(|t| t.wl_surface() == &surface)
+                                {
+                                    toplevel.with_pending_state(|state| {
+	                                        state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
+	                                    });
                                     toplevel.send_configure();
+                                    state.needs_redraw = true;
                                 }
                             } else {
                                 keyboard.set_focus(&mut state, None, serial);
                             }
                         }
-                         if p_state == smithay::backend::input::ButtonState::Pressed && button == winit::event::MouseButton::Left {
-                             if let Some(target_id) = state.start_drag_request.take() {
-                                 let (cur_x, cur_y) = state.layout.tile_for_surface(&target_id)
-                                     .map(|t| (t.position.x, t.position.y))
-                                     .unwrap_or((0, 0));
-                                 let offset_x = last_mouse_pos.x - cur_x as f64;
-                                 let offset_y = last_mouse_pos.y - cur_y as f64;
-                                 state.drag_state = Some((target_id, (offset_x, offset_y)));
-                             }
-                         }
-                        if p_state == smithay::backend::input::ButtonState::Released && button == winit::event::MouseButton::Left {
+                        if p_state == smithay::backend::input::ButtonState::Pressed
+                            && button == winit::event::MouseButton::Left
+                        {
+                            if let Some(target_id) = state.start_drag_request.take() {
+                                let (cur_x, cur_y) = state
+                                    .layout
+                                    .tile_for_surface(&target_id)
+                                    .map(|t| (t.position.x, t.position.y))
+                                    .unwrap_or((0, 0));
+                                let offset_x = last_mouse_pos.x - cur_x as f64;
+                                let offset_y = last_mouse_pos.y - cur_y as f64;
+                                state.drag_state = Some((target_id, (offset_x, offset_y)));
+                                state.needs_redraw = true;
+                            }
+                        }
+                        if p_state == smithay::backend::input::ButtonState::Released
+                            && button == winit::event::MouseButton::Left
+                        {
                             state.drag_state = None;
+                            state.needs_redraw = true;
                         }
                         let event = ButtonEvent {
                             button: button_code,
@@ -373,46 +3738,75 @@ fn main() {
                         };
                         pointer.button(&mut state, &event);
                         pointer.frame(&mut state);
-                    },
+                    }
                     WindowEvent::MouseWheel { delta, phase, .. } => {
                         let pointer = state.seat.get_pointer().unwrap();
                         let time = start_time.elapsed().as_millis() as u32;
                         let (idx, amount, source) = match delta {
-                           winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                               if x != 0.0 {
-                                   (smithay::backend::input::Axis::Horizontal, -x as f64 * 10.0, smithay::backend::input::AxisSource::Wheel)
-                               } else {
-                                   (smithay::backend::input::Axis::Vertical, -y as f64 * 10.0, smithay::backend::input::AxisSource::Wheel)
-                               }
-                           },
-                           winit::event::MouseScrollDelta::PixelDelta(pos) => {
-                               let logical_pos = pos.to_logical::<f64>(state.scale_factor);
-                               if logical_pos.x != 0.0 {
-                                   (smithay::backend::input::Axis::Horizontal, -logical_pos.x, smithay::backend::input::AxisSource::Finger)
-                               } else {
-                                   (smithay::backend::input::Axis::Vertical, -logical_pos.y, smithay::backend::input::AxisSource::Finger)
-                               }
-                           }
+                            winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                                if x != 0.0 {
+                                    (
+                                        smithay::backend::input::Axis::Horizontal,
+                                        -x as f64 * 10.0,
+                                        smithay::backend::input::AxisSource::Wheel,
+                                    )
+                                } else {
+                                    (
+                                        smithay::backend::input::Axis::Vertical,
+                                        -y as f64 * 10.0,
+                                        smithay::backend::input::AxisSource::Wheel,
+                                    )
+                                }
+                            }
+                            winit::event::MouseScrollDelta::PixelDelta(pos) => {
+                                let logical_pos = pos.to_logical::<f64>(state.scale_factor);
+                                if logical_pos.x != 0.0 {
+                                    (
+                                        smithay::backend::input::Axis::Horizontal,
+                                        -logical_pos.x,
+                                        smithay::backend::input::AxisSource::Finger,
+                                    )
+                                } else {
+                                    (
+                                        smithay::backend::input::Axis::Vertical,
+                                        -logical_pos.y,
+                                        smithay::backend::input::AxisSource::Finger,
+                                    )
+                                }
+                            }
                         };
                         if amount != 0.0 {
-                             let (h, v) = if idx == smithay::backend::input::Axis::Horizontal { (amount, 0.0) } else { (0.0, amount) };
-                             let stop_tuple = if phase == winit::event::TouchPhase::Ended {
-                                 if idx == smithay::backend::input::Axis::Horizontal { (true, false) } else { (false, true) }
-                             } else { (false, false) };
-                             let details = smithay::input::pointer::AxisFrame {
-                                 source: Some(source),
-                                 time,
-                                 axis: (h, v),
-                                 stop: stop_tuple,
-                                 v120: Some((0, 0)),
-                                 relative_direction: (smithay::backend::input::AxisRelativeDirection::Identical, smithay::backend::input::AxisRelativeDirection::Identical),
-                             };
-                             pointer.axis(&mut state, details);
-                             pointer.frame(&mut state);
+                            let (h, v) = if idx == smithay::backend::input::Axis::Horizontal {
+                                (amount, 0.0)
+                            } else {
+                                (0.0, amount)
+                            };
+                            let stop_tuple = if phase == winit::event::TouchPhase::Ended {
+                                if idx == smithay::backend::input::Axis::Horizontal {
+                                    (true, false)
+                                } else {
+                                    (false, true)
+                                }
+                            } else {
+                                (false, false)
+                            };
+                            let details = smithay::input::pointer::AxisFrame {
+                                source: Some(source),
+                                time,
+                                axis: (h, v),
+                                stop: stop_tuple,
+                                v120: Some((0, 0)),
+                                relative_direction: (
+                                    smithay::backend::input::AxisRelativeDirection::Identical,
+                                    smithay::backend::input::AxisRelativeDirection::Identical,
+                                ),
+                            };
+                            pointer.axis(&mut state, details);
+                            pointer.frame(&mut state);
                         }
-                    },
+                    }
                     WindowEvent::RedrawRequested => {
-                         let (width, height) = {
+                        let (width, height) = {
                             let size = renderer.window.inner_size();
                             (size.width, size.height)
                         };
@@ -423,6 +3817,10 @@ fn main() {
                             renderer.clear(0.1, 0.1, 0.15, 1.0);
                             use smithay::reexports::wayland_server::Resource;
                             let mut rendered_count = 0;
+                            let mut new_buffer_count = 0;
+                            let mut no_buffer_count = 0;
+                            let mut removed_buffer_count = 0;
+                            let mut unreadable_buffer_count = 0;
                             let before_toplevels = state.toplevels.len();
                             let before_tiles = state.layout.tiles.len();
                             for tile in state.layout.tiles.iter() {
@@ -431,15 +3829,24 @@ fn main() {
                                 }
                             }
                             state.toplevels.retain(|t| t.wl_surface().is_alive());
-                            state.layout.tiles.retain(|t| t.toplevel.wl_surface().is_alive());
-                            if state.toplevels.len() != before_toplevels || state.layout.tiles.len() != before_tiles {
-                                log::warn!("CLEANUP: toplevels {} -> {}, tiles {} -> {}", 
-                                    before_toplevels, state.toplevels.len(),
-                                    before_tiles, state.layout.tiles.len());
+                            state
+                                .layout
+                                .tiles
+                                .retain(|t| t.toplevel.wl_surface().is_alive());
+                            if state.toplevels.len() != before_toplevels
+                                || state.layout.tiles.len() != before_tiles
+                            {
+                                log::warn!(
+                                    "CLEANUP: toplevels {} -> {}, tiles {} -> {}",
+                                    before_toplevels,
+                                    state.toplevels.len(),
+                                    before_tiles,
+                                    state.layout.tiles.len()
+                                );
                             }
                             let scale = state.scale_factor;
-                            let logical_width = (width as f64 / scale) as i32;
-                            let logical_height = (height as f64 / scale) as i32;
+                            let (logical_width, logical_height) =
+                                layout::logical_size_from_physical(width, height, scale);
                             if (logical_width, logical_height) != last_layout_size {
                                 last_layout_size = (logical_width, logical_height);
                                 state.layout.set_view_size(logical_width, logical_height);
@@ -451,7 +3858,6 @@ fn main() {
                             }
                             for tile in state.layout.tiles.iter() {
                                 let wl_surface = tile.toplevel.wl_surface();
-                                let id = wl_surface.id();
                                 let x_offset = tile.position.x;
                                 let y_offset = tile.position.y;
                                 let phys_x = (x_offset as f64 * scale) as i32;
@@ -463,7 +3869,9 @@ fn main() {
                                     wl_surface,
                                     (x_offset, y_offset),
                                     |_, _, &loc| {
-                                        smithay::wayland::compositor::TraversalAction::DoChildren(loc)
+                                        smithay::wayland::compositor::TraversalAction::DoChildren(
+                                            loc,
+                                        )
                                     },
                                     |surface, states, &loc| {
                                         let mut guard = states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
@@ -477,24 +3885,18 @@ fn main() {
                                         let surf_id = surface.id();
                                         match &current.buffer {
                                             Some(smithay::wayland::compositor::BufferAssignment::NewBuffer(b)) => {
+                                                new_buffer_count += 1;
                                                 let buffer_scale = current.buffer_scale;
                                                 let buf_id = b.id();
-                                                if let Some((tex_w, tex_h)) = renderer.lookup_cached_size(&surf_id, &buf_id) {
-                                                    let dest_w = viewport_dst.map(|d| (d.w as f64 * scale).round() as i32)
-                                                        .unwrap_or_else(|| (tex_w as f64 / buffer_scale as f64 * scale).round() as i32);
-                                                    let dest_h = viewport_dst.map(|d| (d.h as f64 * scale).round() as i32)
-                                                        .unwrap_or_else(|| (tex_h as f64 / buffer_scale as f64 * scale).round() as i32);
-                                                    renderer.draw_pixels(surf_id, buf_id, phys_x, phys_y, dest_w, dest_h, 0, 0, &[]);
-                                                    rendered_count += 1;
-                                                } else if let Some((buf_w, buf_h, pixels)) = crate::render::get_buffer_pixels(b) {
+                                                if crate::render::with_buffer_pixels(b, |buf_w, buf_h, bytes_per_row, pixels| {
                                                     let dest_w = viewport_dst.map(|d| (d.w as f64 * scale).round() as i32)
                                                         .unwrap_or_else(|| (buf_w as f64 / buffer_scale as f64 * scale).round() as i32);
                                                     let dest_h = viewport_dst.map(|d| (d.h as f64 * scale).round() as i32)
                                                         .unwrap_or_else(|| (buf_h as f64 / buffer_scale as f64 * scale).round() as i32);
-                                                    renderer.draw_pixels(surf_id, buf_id, phys_x, phys_y, dest_w, dest_h, buf_w, buf_h, &pixels);
+                                                    renderer.draw_pixels(surf_id.clone(), buf_id, phys_x, phys_y, dest_w, dest_h, buf_w, buf_h, bytes_per_row, pixels);
                                                     rendered_count += 1;
-                                                } else {
-                                                    log::warn!("RENDER: unsupported buffer format for {:?} — not wl_shm (EGL/DMA-buf?); run with LIBGL_ALWAYS_SOFTWARE=1", surf_id);
+                                                }).is_none() {
+                                                    unreadable_buffer_count += 1;
                                                     // Still try cached texture from a previous frame if available
                                                     if renderer.draw_from_cache(&surf_id, phys_x, phys_y, scale, viewport_dst) {
                                                         rendered_count += 1;
@@ -502,10 +3904,12 @@ fn main() {
                                                 }
                                             },
                                             Some(smithay::wayland::compositor::BufferAssignment::Removed) => {
+                                                removed_buffer_count += 1;
                                                 log::debug!("RENDER: buffer removed for {:?}", surf_id);
                                                 renderer.evict_texture(&surf_id);
                                             },
                                             None => {
+                                                no_buffer_count += 1;
                                                 // No new buffer this commit — re-use the cached texture if present.
                                                 if renderer.draw_from_cache(&surf_id, phys_x, phys_y, scale, viewport_dst) {
                                                     rendered_count += 1;
@@ -513,9 +3917,11 @@ fn main() {
                                             }
                                         }
                                     },
-                                    |_, _, _| true
+                                    |_, _, _| true,
                                 );
-                                let is_focused = state.seat.get_keyboard()
+                                let is_focused = state
+                                    .seat
+                                    .get_keyboard()
                                     .and_then(|k| k.current_focus())
                                     .map(|s| &s == wl_surface)
                                     .unwrap_or(false);
@@ -541,7 +3947,9 @@ fn main() {
                                     None => continue,
                                 };
                                 let parent_id = parent_surface.id();
-                                let parent_pos = state.layout.tile_for_surface(&parent_id)
+                                let parent_pos = state
+                                    .layout
+                                    .tile_for_surface(&parent_id)
                                     .map(|t| (t.position.x, t.position.y))
                                     .unwrap_or((0, 0));
                                 let popup_geo = smithay::wayland::compositor::with_states(
@@ -549,7 +3957,9 @@ fn main() {
                                     |states| {
                                         let mut cached = states.cached_state
                                             .get::<smithay::wayland::shell::xdg::PopupCachedState>();
-                                        cached.current().last_acked
+                                        cached
+                                            .current()
+                                            .last_acked
                                             .as_ref()
                                             .map(|c| c.state.geometry)
                                     },
@@ -564,7 +3974,9 @@ fn main() {
                                     popup.wl_surface(),
                                     (popup_log_x, popup_log_y),
                                     |_, _, &loc| {
-                                        smithay::wayland::compositor::TraversalAction::DoChildren(loc)
+                                        smithay::wayland::compositor::TraversalAction::DoChildren(
+                                            loc,
+                                        )
                                     },
                                     |surface, states, &loc| {
                                         let mut guard = states.cached_state.get::<smithay::wayland::compositor::SurfaceAttributes>();
@@ -575,29 +3987,65 @@ fn main() {
                                             let py = (loc.1 as f64 * scale) as i32;
                                             let surf_id = surface.id();
                                             let buf_id = b.id();
-                                            if let Some((tex_w, tex_h)) = renderer.lookup_cached_size(&surf_id, &buf_id) {
-                                                let dest_w = (tex_w as f64 / buffer_scale as f64 * scale).round() as i32;
-                                                let dest_h = (tex_h as f64 / buffer_scale as f64 * scale).round() as i32;
-                                                renderer.draw_pixels(surf_id, buf_id, px, py, dest_w, dest_h, 0, 0, &[]);
-                                            } else if let Some((buf_w, buf_h, pixels)) = crate::render::get_buffer_pixels(b) {
+                                            let _ = crate::render::with_buffer_pixels(b, |buf_w, buf_h, bytes_per_row, pixels| {
                                                 let dest_w = (buf_w as f64 / buffer_scale as f64 * scale).round() as i32;
                                                 let dest_h = (buf_h as f64 / buffer_scale as f64 * scale).round() as i32;
-                                                renderer.draw_pixels(surf_id, buf_id, px, py, dest_w, dest_h, buf_w, buf_h, &pixels);
-                                            }
+                                                renderer.draw_pixels(surf_id, buf_id, px, py, dest_w, dest_h, buf_w, buf_h, bytes_per_row, pixels);
+                                            });
                                         }
                                     },
                                     |_, _, _| true,
                                 );
                             }
-                            if rendered_count == 0 && !state.layout.tiles.is_empty() {
-                                log::warn!(
-                                    "RENDER: {} tiles present but nothing rendered — likely unsupported buffer format or no committed buffer yet",
-                                    state.layout.tiles.len()
-                                );
+                            if rendered_count > 0 || state.layout.tiles.is_empty() {
+                                blank_render_since = None;
+                            } else {
+                                let now = std::time::Instant::now();
+                                let blank_since = *blank_render_since.get_or_insert(now);
+                                if now.duration_since(blank_since)
+                                    >= std::time::Duration::from_secs(5)
+                                    && now.duration_since(last_render_diagnostic)
+                                        >= std::time::Duration::from_secs(5)
+                                {
+                                    last_render_diagnostic = now;
+                                    log::warn!(
+                                        "RENDER: {} tiles have not produced a drawable frame for {}s; surfaces: new_buffer={}, no_buffer={}, removed_buffer={}, unreadable_buffer={}.",
+                                        state.layout.tiles.len(),
+                                        now.duration_since(blank_since).as_secs(),
+                                        new_buffer_count,
+                                        no_buffer_count,
+                                        removed_buffer_count,
+                                        unreadable_buffer_count
+                                    );
+                                }
                             }
                             if let Err(e) = renderer.swap_buffers() {
                                 log::error!("Failed to swap buffers: {}", e);
                             }
+                            let presented_at = std::time::Instant::now();
+                            if let Some(redraw_since) = pending_redraw_since.take() {
+                                let wait_ms =
+                                    presented_at.duration_since(redraw_since).as_secs_f64()
+                                        * 1000.0;
+                                perf_max_redraw_wait_ms = perf_max_redraw_wait_ms.max(wait_ms);
+                                if wait_ms > 25.0 {
+                                    perf_late_redraws = perf_late_redraws.saturating_add(1);
+                                }
+                            }
+                            if let Some((input_at, commit_baseline)) = pending_input_sample
+                                && state.commit_counter > commit_baseline
+                            {
+                                let sample =
+                                    presented_at.duration_since(input_at).as_secs_f64() * 1000.0;
+                                input_to_present_ms = Some(
+                                    input_to_present_ms
+                                        .map(|previous| previous * 0.8 + sample * 0.2)
+                                        .unwrap_or(sample),
+                                );
+                                pending_input_sample = None;
+                            }
+                            perf_redraws = perf_redraws.saturating_add(1);
+                            state.needs_redraw = false;
                             let t = state.start_time.elapsed().as_millis() as u32;
                             for cb in state.pending_frame_callbacks.drain(..) {
                                 cb.done(t);
@@ -608,21 +4056,75 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
-                  match display.dispatch_clients(&mut state) {
-                      Ok(_) => {
-                          display.flush_clients().unwrap();
-                      }
-                      Err(_) => {}
-                  }
-                  let now = std::time::Instant::now();
-                  if now.duration_since(last_frame) >= frame_duration {
-                      renderer.request_redraw();
-                      last_frame = now;
-                  } else {
-                      target.set_control_flow(ControlFlow::WaitUntil(
-                          last_frame + frame_duration,
-                      ));
-                  }
+                let now = std::time::Instant::now();
+                if let Some(parent_pid) = display_worker_parent
+                    && now.duration_since(last_parent_check) >= std::time::Duration::from_secs(1)
+                {
+                    last_parent_check = now;
+                    if !process_exists(parent_pid) {
+                        log::info!(
+                            "Dedicated display parent {} exited; closing worker",
+                            parent_pid
+                        );
+                        target.exit();
+                        return;
+                    }
+                }
+                state.poll_host_clipboard();
+                reap_classic_connections(&mut active_classic_connections);
+                reap_exited_managed_displays(&mut managed_displays, &mut active_container_sessions);
+                sync_managed_displays(&managed_displays);
+                reap_exited_container_sessions(&mut active_container_sessions);
+                sync_active_container_sessions(&active_container_sessions);
+                match display.dispatch_clients(&mut state) {
+                    Ok(_) => {
+                        state.request_pending_guest_clipboard();
+                        if let Err(error) = display.flush_clients() {
+                            log::debug!("Failed to flush Wayland clients: {}", error);
+                        }
+                    }
+                    Err(_) => {}
+                }
+                if state.needs_redraw && pending_redraw_since.is_none() {
+                    pending_redraw_since = Some(now);
+                }
+                if now.duration_since(perf_window_start) >= std::time::Duration::from_secs(1) {
+                    let elapsed = now.duration_since(perf_window_start).as_secs_f64();
+                    let redraw_delta = perf_redraws.saturating_sub(perf_last_redraws);
+                    let commit_delta = state.commit_counter.saturating_sub(perf_last_commits);
+                    container_mode::record_performance_snapshot(
+                        redraw_delta as f64 / elapsed,
+                        commit_delta as f64 / elapsed,
+                        state.layout.tiles.len(),
+                        state.needs_redraw,
+                        state.pending_frame_callbacks.len(),
+                        perf_late_redraws as f64 / elapsed,
+                        perf_max_redraw_wait_ms,
+                        input_to_present_ms,
+                    );
+                    perf_window_start = now;
+                    perf_last_redraws = perf_redraws;
+                    perf_last_commits = state.commit_counter;
+                    perf_late_redraws = 0;
+                    perf_max_redraw_wait_ms = 0.0;
+                }
+                let poll_interval = if state.needs_redraw
+                    || !state.layout.tiles.is_empty()
+                    || !active_container_sessions.is_empty()
+                {
+                    active_poll_interval
+                } else {
+                    idle_poll_interval
+                };
+                if state.needs_redraw && now.duration_since(last_frame) >= frame_duration {
+                    renderer.request_redraw();
+                    last_frame = now;
+                    target.set_control_flow(ControlFlow::WaitUntil(now + poll_interval));
+                } else if state.needs_redraw {
+                    target.set_control_flow(ControlFlow::WaitUntil(last_frame + frame_duration));
+                } else {
+                    target.set_control_flow(ControlFlow::WaitUntil(now + poll_interval));
+                }
             }
             Event::Resumed => {
                 // Install menu bar once, after winit's applicationDidFinishLaunching.
@@ -642,11 +4144,12 @@ fn main() {
                             if let RawWindowHandle::AppKit(h) = handle.as_raw() {
                                 let ns_view = h.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
                                 // -[NSView window] returns id (@), not *mut c_void (^v)
-                                let ns_win: *mut objc2::runtime::AnyObject = unsafe {
-                                    objc2::msg_send![ns_view, window]
-                                };
+                                let ns_win: *mut objc2::runtime::AnyObject =
+                                    unsafe { objc2::msg_send![ns_view, window] };
                                 if !ns_win.is_null() {
-                                    menu_bar::disable_window_tabbing(ns_win as *mut std::ffi::c_void);
+                                    menu_bar::disable_window_tabbing(
+                                        ns_win as *mut std::ffi::c_void,
+                                    );
                                 }
                             }
                         }
@@ -654,7 +4157,30 @@ fn main() {
                     log::info!("macOS menu bar installed");
                 }
             }
+            Event::LoopExiting => {
+                for mut connection in active_classic_connections.drain(..) {
+                    let _ = connection.child.kill();
+                    let _ = connection.child.wait();
+                }
+                while let Some(index) = active_container_sessions
+                    .first()
+                    .map(|session| session.index)
+                {
+                    let _ = stop_active_container_session(&mut active_container_sessions, index);
+                    cleanup_named_container_session(index);
+                }
+                for mut managed in managed_displays.drain(..) {
+                    let _ = terminate_display_worker(&mut managed.worker);
+                }
+                sync_managed_displays(&managed_displays);
+                if display_worker_slot.is_some() {
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
+                }
+                if let Some(path) = control_socket_path.as_deref() {
+                    control_api::remove_socket(path);
+                }
+            }
             _ => {}
         }
-    }).unwrap();
+    }
 }

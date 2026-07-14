@@ -43,6 +43,13 @@ pub(crate) fn resolve_command_path(
     None
 }
 
+pub(crate) fn find_command_path(name: &str, child_path: &str) -> Option<PathBuf> {
+    let mut searched = Vec::new();
+
+    find_executable_in_path(name, &std::env::var_os("PATH"), &mut searched)
+        .or_else(|| find_executable_in_path(name, &Some(child_path.into()), &mut searched))
+}
+
 pub(crate) fn build_child_path() -> String {
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -59,6 +66,7 @@ pub(crate) fn build_child_path() -> String {
         "/usr/local/bin",
         "/usr/local/sbin",
         "/opt/orbstack/bin",
+        "/Applications/OrbStack.app/Contents/MacOS/bin",
         "/Applications/Docker.app/Contents/Resources/bin",
         "/opt/local/bin",
         "/opt/local/sbin",

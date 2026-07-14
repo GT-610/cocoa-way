@@ -1,0 +1,109 @@
+#!/bin/sh
+set -u
+
+log() {
+    printf '%s\n' "cocoa-way clipboard relay: $*" >&2
+}
+
+transfer() {
+    destination=$1
+    state_file=$2
+    data_file=$(mktemp)
+    trap 'rm -f "$data_file"' EXIT
+    cat >"$data_file"
+    # Nested compositors often announce an empty selection at startup. Do not
+    # let that erase a valid host clipboard before both watchers are ready.
+    [ -s "$data_file" ] || exit 0
+    digest=$(cksum <"$data_file" | awk '{ print $1 ":" $2 }')
+
+    lock_dir="${state_file}.lock"
+    attempts=0
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 50 ] || exit 0
+        sleep 0.01
+    done
+    trap 'rmdir "$lock_dir" 2>/dev/null; rm -f "$data_file"' EXIT
+
+    previous=$(cat "$state_file" 2>/dev/null || true)
+    if [ "$previous" = "$digest" ]; then
+        exit 0
+    fi
+    printf '%s\n' "$digest" >"$state_file"
+    # wl-copy owns the selection for its lifetime. Detach it so this short-lived
+    # transfer can release the loop-suppression lock immediately.
+    WAYLAND_DISPLAY="$destination" wl-copy --type 'text/plain;charset=utf-8' <"$data_file" &
+}
+
+if [ "${1:-}" = "--transfer" ]; then
+    shift
+    transfer "$@"
+    exit
+fi
+
+outer_display=${WAYLAND_DISPLAY:-wayland-0}
+"$@" &
+application_pid=$!
+
+inner_display=
+attempts=0
+while [ "$attempts" -lt 100 ] && kill -0 "$application_pid" 2>/dev/null; do
+    for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        [ -S "$socket" ] || continue
+        candidate=${socket##*/}
+        [ "$candidate" = "$outer_display" ] && continue
+        inner_display=$candidate
+        break
+    done
+    [ -n "$inner_display" ] && break
+    attempts=$((attempts + 1))
+    sleep 0.05
+done
+
+if [ -n "$inner_display" ]; then
+    state_file="$XDG_RUNTIME_DIR/cocoa-way-clipboard.digest"
+    log "bridging $outer_display <-> $inner_display"
+
+    start_outer_watcher() {
+        WAYLAND_DISPLAY="$outer_display" wl-paste --type text --watch \
+            "$0" --transfer "$inner_display" "$state_file" &
+        outer_watcher=$!
+    }
+
+    start_inner_watcher() {
+        WAYLAND_DISPLAY="$inner_display" wl-paste --type text --watch \
+            "$0" --transfer "$outer_display" "$state_file" &
+        inner_watcher=$!
+    }
+
+    supervise_watchers() {
+        start_outer_watcher
+        start_inner_watcher
+        trap 'kill "$outer_watcher" "$inner_watcher" 2>/dev/null || true' EXIT INT TERM
+
+        while kill -0 "$application_pid" 2>/dev/null; do
+            if ! kill -0 "$outer_watcher" 2>/dev/null; then
+                wait "$outer_watcher" 2>/dev/null || true
+                log "outer watcher exited; restarting"
+                start_outer_watcher
+            fi
+            if ! kill -0 "$inner_watcher" 2>/dev/null; then
+                wait "$inner_watcher" 2>/dev/null || true
+                log "inner watcher exited; restarting"
+                start_inner_watcher
+            fi
+            sleep 0.25
+        done
+    }
+
+    supervise_watchers &
+    watcher_supervisor=$!
+else
+    log "nested compositor display was not found; clipboard bridge is disabled"
+fi
+
+wait "$application_pid"
+status=$?
+[ -z "${watcher_supervisor:-}" ] || kill "$watcher_supervisor" 2>/dev/null || true
+[ -z "${watcher_supervisor:-}" ] || wait "$watcher_supervisor" 2>/dev/null || true
+exit "$status"

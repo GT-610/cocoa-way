@@ -124,8 +124,6 @@ impl EGLContext {
         }
     }
 
-
-
     /// Creates a new configless `EGLContext` from a given `EGLDisplay`
     pub fn new(display: &EGLDisplay) -> Result<EGLContext, Error> {
         Self::new_internal(display, None, None, None)

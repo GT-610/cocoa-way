@@ -10,11 +10,12 @@
 //! Buffer types supported:
 //! - [DumbBuffers](dumb::DumbBuffer)
 //! - [GbmBuffers](::gbm::BufferObject)
-//! - [DmaBufs](dmabuf::Dmabuf)
+//! - [DmaBufs](dmabuf::Dmabuf) (Unix only)
 //!
 //! Helpers:
 //! - [`Swapchain`] to help with buffer management for framebuffers
 
+#[cfg(unix)]
 pub mod dmabuf;
 #[cfg(feature = "backend_drm")]
 pub mod dumb;
@@ -24,6 +25,7 @@ pub mod gbm;
 #[cfg(feature = "backend_vulkan")]
 pub mod vulkan;
 
+#[cfg(unix)]
 mod swapchain;
 use std::{
     cell::RefCell,
@@ -32,6 +34,7 @@ use std::{
 };
 
 use crate::utils::{Buffer as BufferCoords, Size};
+#[cfg(unix)]
 pub use swapchain::{Slot, Swapchain};
 
 pub use drm_fourcc::{

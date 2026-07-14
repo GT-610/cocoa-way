@@ -85,13 +85,13 @@ pub fn map_key(key: PhysicalKey) -> Option<u32> {
             KeyCode::Numpad3 => Some(81),
             KeyCode::Numpad0 => Some(82),
             KeyCode::NumpadDecimal => Some(83),
-            KeyCode::IntlBackslash => Some(86),  
+            KeyCode::IntlBackslash => Some(86),
             KeyCode::F11 => Some(87),
             KeyCode::F12 => Some(88),
             KeyCode::NumpadEnter => Some(96),
             KeyCode::ControlRight => Some(97),
             KeyCode::NumpadDivide => Some(98),
-            KeyCode::PrintScreen => Some(99),  
+            KeyCode::PrintScreen => Some(99),
             KeyCode::AltRight => Some(100),
             KeyCode::Home => Some(102),
             KeyCode::ArrowUp => Some(103),
@@ -111,9 +111,22 @@ pub fn map_key(key: PhysicalKey) -> Option<u32> {
             KeyCode::Pause => Some(119),
             KeyCode::SuperLeft => Some(125),
             KeyCode::SuperRight => Some(126),
-            KeyCode::ContextMenu => Some(127),  
+            KeyCode::ContextMenu => Some(127),
             _ => None,
         },
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipboard_shortcut_keys_use_linux_evdev_codes() {
+        assert_eq!(map_key(PhysicalKey::Code(KeyCode::ControlLeft)), Some(29));
+        assert_eq!(map_key(PhysicalKey::Code(KeyCode::ShiftLeft)), Some(42));
+        assert_eq!(map_key(PhysicalKey::Code(KeyCode::KeyC)), Some(46));
+        assert_eq!(map_key(PhysicalKey::Code(KeyCode::KeyV)), Some(47));
     }
 }

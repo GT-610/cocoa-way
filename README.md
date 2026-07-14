@@ -2,10 +2,10 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-0.2.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
 [![macOS](https://img.shields.io/badge/macOS-11.0+-black.svg)](https://www.apple.com/macos/)
 [![Mentioned in Awesome Rust](https://awesome.re/mentioned-badge.svg)](https://github.com/rust-unofficial/awesome-rust)
 [![Awesome Mac](https://img.shields.io/badge/Awesome-macOS-black?logo=apple)](https://github.com/jaywcjlove/awesome-mac)
@@ -78,17 +78,19 @@ cargo build --release
    ./run_waypipe.sh ssh user@linux-host firefox
    ```
 
-3. **Or add persistent container sessions in `~/.config/cocoa-way/container-sessions.toml`:**
+3. **Or use `Connections > Connect to Machine...` in the macOS menu:**
+
+   Enter `user@host`, the application, and an optional display slot. Enable **Save this connection for later** to add it to the Connections menu immediately. Saved entries are written to `~/.config/cocoa-way/connections.toml` with private file permissions; passwords are never stored.
+
+4. **Add persistent container sessions in `~/.config/cocoa-way/container-sessions.toml`:**
 
    ```toml
    [[session]]
-   name = "Ubuntu (Apple Container)"
+   name = "Niri Desktop (Apple Container)"
    runtime = "container"
-   image = "docker.io/library/ubuntu:24.04"
-   profile = "single-app"
-   app = "weston-terminal"
-   container_socket = "/tmp/cocoa-way/waypipe.sock"
-   runtime_args = ["--rosetta"]
+   image = "localhost/cocoa-way-niri:latest"
+   profile = "niri"
+   command = "niri"
    ```
 
    Then use the Container menu inside Cocoa-Way to launch the session.
@@ -101,7 +103,23 @@ Cocoa-Way has two control modes: Classic connections for SSH / local sockets, an
 - `runtime = "docker"` works with Docker Desktop and compatible CLIs.
 - `runtime = "orb"` or `runtime = "orbstack"` works with OrbStack.
 
-For Apple Container, Cocoa-Way uses `container run --publish-socket ...` so the waypipe socket is exported back to macOS without requiring a shared bind mount. For Docker and OrbStack, Cocoa-Way bind-mounts the host socket directory into the container and connects over that local socket.
+For Apple Container, Cocoa-Way prefers Transport V2: a multiplexed waypipe relay carried by `container run --publish-socket`. If that capability is unavailable or fails during startup, Cocoa-Way falls back to its stdio compatibility relay automatically. For Docker and OrbStack, Cocoa-Way bind-mounts the host socket directory into the container and connects over that local socket.
+
+Container Mode can assign `display = "auto"`, `display = "default"`, or a stable named display to a session. `auto` uses the main compositor window when it is free and creates a dedicated Cocoa-Way display window when another GUI session already occupies it.
+
+The Apple Container, Docker, and OrbStack pages expose runtime status, container lifecycle controls, logs, resource usage, and terminal access. Stopping OrbStack pauses Docker-compatible inventory polling so Cocoa-Way does not wake the service again while it is intentionally stopped.
+
+### Local Control
+
+The compositor exposes a local Unix-socket control API while it is running. `cocoa-wayctl` provides JSON-friendly status and lifecycle commands without bypassing the GUI's safety checks:
+
+```bash
+cocoa-wayctl --json status
+cocoa-wayctl sessions
+cocoa-wayctl launch "Niri Desktop (Apple Container)"
+```
+
+`cocoa-way-mcp` is an optional, local stdio adapter over the same API. Its MCP tools are read-only by design: status, sessions, displays, images, and recent logs. Launch, stop, and destructive resource operations are not exposed to AI clients.
 
 ## Architecture
 
@@ -137,7 +155,7 @@ graph LR
 - [X] macOS backend (METAL)
 - [X] Waypipe integration
 - [X] HiDPI scaling
-- [ ] winit and objc update
+- [X] winit update
 - [ ] Multi-monitor support
 - [X] Clipboard sync
 

@@ -1,5 +1,15 @@
-use rustix::time::{ClockId, Timespec};
+//! Cross-platform clock utilities for timing
+//!
+//! Uses rustix on Unix and std::time on Windows
+
 use std::{cmp::Ordering, marker::PhantomData, ops::Add, time::Duration};
+
+// Platform-specific time types
+#[cfg(unix)]
+use rustix::time::{clock_gettime, ClockId, Timespec};
+
+#[cfg(windows)]
+use crate::compat::time::{clock_gettime, ClockId, Timespec};
 
 /// Marker for clock source that never returns a negative [`Time`]
 pub trait NonNegativeClockSource: ClockSource {}
@@ -43,7 +53,7 @@ impl<Kind: ClockSource> Clock<Kind> {
 
     /// Returns the current time
     pub fn now(&self) -> Time<Kind> {
-        rustix::time::clock_gettime(Kind::ID).into()
+        clock_gettime(Kind::ID).into()
     }
 
     /// Gets the id of the clock
@@ -121,7 +131,7 @@ impl<Kind> std::fmt::Debug for Time<Kind> {
 impl<Kind> PartialEq for Time<Kind> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.tp == other.tp && self._kind == other._kind
+        self.tp.tv_sec == other.tp.tv_sec && self.tp.tv_nsec == other.tp.tv_nsec
     }
 }
 
@@ -151,8 +161,8 @@ impl<Kind: NonNegativeClockSource> From<Duration> for Time<Kind> {
     #[inline]
     fn from(tp: Duration) -> Self {
         let tp = Timespec {
-            tv_sec: tp.as_secs() as rustix::time::Secs,
-            tv_nsec: tp.subsec_nanos() as rustix::time::Nsecs,
+            tv_sec: tp.as_secs() as i64,
+            tv_nsec: tp.subsec_nanos() as i64,
         };
         Time {
             tp,
@@ -177,7 +187,7 @@ impl<Kind> From<Time<Kind>> for Timespec {
     }
 }
 
-const NANOS_PER_SEC: rustix::time::Nsecs = 1_000_000_000;
+const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 fn saturating_sub_timespec(lhs: Timespec, rhs: Timespec) -> Option<Duration> {
     debug_assert!(!lhs.tv_sec.is_negative());

@@ -24,8 +24,13 @@ jobs:
       - name: Install dependencies
         run: brew install libxkbcommon pixman pkg-config
 
+      - name: Verify release version
+        run: |
+          PACKAGE_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["name"] == "cocoa-way"))')
+          test "${GITHUB_REF_NAME}" = "v${PACKAGE_VERSION}"
+
       - name: Build for arm64
-        run: cargo build --release
+        run: cargo build --release --bins --locked
 
       - name: Create .app Bundle
         run: |
@@ -37,6 +42,8 @@ jobs:
           mkdir -p "${APP_DIR}/Contents/Resources"
           
           cp target/release/cocoa-way "${APP_DIR}/Contents/MacOS/"
+          cp target/release/cocoa-wayctl "${APP_DIR}/Contents/MacOS/"
+          cp target/release/cocoa-way-mcp "${APP_DIR}/Contents/MacOS/"
           cp assets/icon.png "${APP_DIR}/Contents/Resources/AppIcon.png"
           
           cat > "${APP_DIR}/Contents/Info.plist" << 'PLIST'
@@ -78,7 +85,12 @@ jobs:
 
       - name: Verify bundled dylibs
         run: |
-          ! otool -L Cocoa-Way.app/Contents/MacOS/cocoa-way | grep -E '/(opt/homebrew|usr/local|nix)/'
+          for executable in cocoa-way cocoa-wayctl cocoa-way-mcp; do
+            ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -E '/(opt/homebrew|usr/local|nix)/'
+          done
+          codesign --verify --deep --strict --verbose=2 Cocoa-Way.app
+          Cocoa-Way.app/Contents/MacOS/cocoa-wayctl --help >/dev/null
+          Cocoa-Way.app/Contents/MacOS/cocoa-way-mcp </dev/null
 
       - name: Create ZIP archive
         run: |

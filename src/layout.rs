@@ -1,38 +1,53 @@
-use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::utils::{Logical, Point, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
+
+pub const MAX_LOGICAL_OUTPUT_DIMENSION: i32 = 16_384;
+
+pub fn sanitize_logical_size(width: f64, height: f64) -> (i32, i32) {
+    let sanitize = |value: f64| {
+        if value.is_finite() {
+            value
+                .round()
+                .clamp(1.0, f64::from(MAX_LOGICAL_OUTPUT_DIMENSION)) as i32
+        } else {
+            1
+        }
+    };
+    (sanitize(width), sanitize(height))
+}
+
+pub fn logical_size_from_physical(width: u32, height: u32, scale: f64) -> (i32, i32) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    sanitize_logical_size(f64::from(width) / scale, f64::from(height) / scale)
+}
 #[derive(Debug)]
 pub struct Tile {
     pub toplevel: ToplevelSurface,
     pub position: Point<i32, Logical>,
     pub size: Size<i32, Logical>,
     pub is_focused: bool,
-    pub border_width: i32,
 }
 impl Tile {
-    pub fn new(toplevel: ToplevelSurface, position: Point<i32, Logical>, size: Size<i32, Logical>) -> Self {
+    pub fn new(
+        toplevel: ToplevelSurface,
+        position: Point<i32, Logical>,
+        size: Size<i32, Logical>,
+    ) -> Self {
         Self {
             toplevel,
             position,
             size,
             is_focused: false,
-            border_width: 2,
         }
     }
     pub fn surface_id(&self) -> ObjectId {
         self.toplevel.wl_surface().id()
-    }
-    pub fn bounds(&self) -> (Point<i32, Logical>, Size<i32, Logical>) {
-        (self.position, self.size)
-    }
-    pub fn contains_point(&self, point: Point<f64, Logical>) -> bool {
-        let x = point.x as i32;
-        let y = point.y as i32;
-        x >= self.position.x 
-            && x < self.position.x + self.size.w
-            && y >= self.position.y 
-            && y < self.position.y + self.size.h
     }
     pub fn request_size(&self) {
         self.toplevel.with_pending_state(|state| {
@@ -51,6 +66,7 @@ pub struct Layout {
 }
 impl Layout {
     pub fn new(width: i32, height: i32) -> Self {
+        let (width, height) = sanitize_logical_size(f64::from(width), f64::from(height));
         Self {
             tiles: Vec::new(),
             focused_idx: None,
@@ -60,7 +76,17 @@ impl Layout {
         }
     }
     pub fn set_view_size(&mut self, width: i32, height: i32) {
-        self.view_size = Size::from((width, height));
+        let (safe_width, safe_height) = sanitize_logical_size(f64::from(width), f64::from(height));
+        if (safe_width, safe_height) != (width, height) {
+            log::warn!(
+                "Ignoring unsafe Wayland layout size {}x{}; clamped to {}x{}",
+                width,
+                height,
+                safe_width,
+                safe_height
+            );
+        }
+        self.view_size = Size::from((safe_width, safe_height));
         self.relayout();
     }
     pub fn add_tile(&mut self, toplevel: ToplevelSurface) {
@@ -72,7 +98,11 @@ impl Layout {
         self.relayout();
     }
     pub fn remove_tile(&mut self, surface_id: &ObjectId) {
-        if let Some(idx) = self.tiles.iter().position(|t| &t.surface_id() == surface_id) {
+        if let Some(idx) = self
+            .tiles
+            .iter()
+            .position(|t| &t.surface_id() == surface_id)
+        {
             self.tiles.remove(idx);
             if let Some(focused) = self.focused_idx {
                 if focused >= self.tiles.len() {
@@ -114,42 +144,33 @@ impl Layout {
             x += tile_size.w + self.gap;
         }
     }
-    pub fn focus_at(&mut self, point: Point<f64, Logical>) -> Option<&Tile> {
-        for (i, tile) in self.tiles.iter().enumerate() {
-            if tile.contains_point(point) {
-                self.focused_idx = Some(i);
-                return Some(tile);
-            }
-        }
-        None
-    }
-    pub fn focused_tile(&self) -> Option<&Tile> {
-        self.focused_idx.and_then(|i| self.tiles.get(i))
-    }
     pub fn tile_for_surface(&self, surface_id: &ObjectId) -> Option<&Tile> {
         self.tiles.iter().find(|t| &t.surface_id() == surface_id)
     }
     pub fn move_tile(&mut self, surface_id: &ObjectId, x: i32, y: i32) {
-        if let Some(tile) = self.tiles.iter_mut().find(|t| &t.surface_id() == surface_id) {
+        if let Some(tile) = self
+            .tiles
+            .iter_mut()
+            .find(|t| &t.surface_id() == surface_id)
+        {
             tile.position = Point::from((x, y));
         }
     }
-    pub fn focus_next(&mut self) {
-        if let Some(idx) = self.focused_idx {
-            if !self.tiles.is_empty() {
-                self.focused_idx = Some((idx + 1) % self.tiles.len());
-            }
-        } else if !self.tiles.is_empty() {
-            self.focused_idx = Some(0);
-        }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_size_rejects_invalid_and_oversized_dimensions() {
+        assert_eq!(sanitize_logical_size(716.0, 21_161.0), (716, 16_384));
+        assert_eq!(sanitize_logical_size(f64::NAN, -4.0), (1, 1));
     }
-    pub fn focus_prev(&mut self) {
-        if let Some(idx) = self.focused_idx {
-            if !self.tiles.is_empty() {
-                self.focused_idx = Some(if idx == 0 { self.tiles.len() - 1 } else { idx - 1 });
-            }
-        } else if !self.tiles.is_empty() {
-            self.focused_idx = Some(self.tiles.len() - 1);
-        }
+
+    #[test]
+    fn physical_size_is_scaled_before_clamping() {
+        assert_eq!(logical_size_from_physical(3200, 2400, 2.0), (1600, 1200));
+        assert_eq!(logical_size_from_physical(800, 600, 0.0), (800, 600));
     }
 }

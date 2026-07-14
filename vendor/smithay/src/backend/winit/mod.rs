@@ -25,6 +25,7 @@ use std::time::Duration;
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, PostAction, Readiness, Token};
 use tracing::{debug, info, info_span, instrument, trace, warn};
+#[cfg(feature = "backend_winit_wayland")]
 use wayland_egl as wegl;
 use winit::platform::pump_events::PumpStatus;
 use winit::platform::scancode::PhysicalKeyExtScancode;
@@ -133,6 +134,7 @@ where
                 })?;
 
         let (surface, is_x11) = match window.window_handle().map(|handle| handle.as_raw()) {
+            #[cfg(feature = "backend_winit_wayland")]
             Ok(RawWindowHandle::Wayland(handle)) => {
                 debug!("Winit backend: Wayland");
                 let size = window.inner_size();

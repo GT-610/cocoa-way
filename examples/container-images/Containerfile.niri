@@ -1,0 +1,17 @@
+FROM registry.fedoraproject.org/fedora:42
+
+RUN dnf install -y \
+        ca-certificates \
+        dbus-daemon \
+        foot \
+        niri \
+        perl \
+        waypipe \
+        wl-clipboard \
+        xterm \
+    && dnf clean all
+
+COPY examples/container-images/cocoa-way-clipboard-relay /usr/local/bin/cocoa-way-clipboard-relay
+RUN chmod +x /usr/local/bin/cocoa-way-clipboard-relay
+
+CMD ["niri"]

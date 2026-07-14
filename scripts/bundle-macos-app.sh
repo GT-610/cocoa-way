@@ -17,7 +17,28 @@ fi
 
 mkdir -p "${FRAMEWORKS_DIR}"
 
-QUEUE=("${MAIN_BIN}")
+APP_EXECUTABLES=("${MAIN_BIN}")
+for helper in cocoa-wayctl cocoa-way-mcp; do
+    helper_path="${APP_DIR}/Contents/MacOS/${helper}"
+    if [[ -f "${helper_path}" ]]; then
+        APP_EXECUTABLES+=("${helper_path}")
+    fi
+done
+
+QUEUE=("${APP_EXECUTABLES[@]}")
+
+is_app_executable() {
+    local candidate=$1
+    local executable
+
+    for executable in "${APP_EXECUTABLES[@]}"; do
+        if [[ "${candidate}" == "${executable}" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 is_bundle_candidate() {
     case "$1" in
@@ -68,7 +89,7 @@ copy_and_rewrite_dependency() {
         queue_file "${bundled_path}"
     fi
 
-    if [[ "${current}" == "${MAIN_BIN}" ]]; then
+    if is_app_executable "${current}"; then
         rewritten_path="@executable_path/../Frameworks/${basename}"
     else
         rewritten_path="@rpath/${basename}"
@@ -78,7 +99,9 @@ copy_and_rewrite_dependency() {
     install_name_tool -change "${dependency}" "${rewritten_path}" "${current}" 2>/dev/null || true
 }
 
-add_rpath_if_needed "${MAIN_BIN}" "@executable_path/../Frameworks"
+for executable in "${APP_EXECUTABLES[@]}"; do
+    add_rpath_if_needed "${executable}" "@executable_path/../Frameworks"
+done
 
 index=0
 while [[ ${index} -lt ${#QUEUE[@]} ]]; do
@@ -93,3 +116,17 @@ while [[ ${index} -lt ${#QUEUE[@]} ]]; do
         fi
     done < <(otool -L "${current}" | tail -n +2 | awk '{print $1}')
 done
+
+# install_name_tool invalidates the ad-hoc signatures Cargo places on Mach-O
+# binaries. Re-sign nested code first so macOS can launch the bundled helpers.
+if command -v codesign >/dev/null 2>&1; then
+    while IFS= read -r bundled_library; do
+        codesign --force --sign - --timestamp=none "${bundled_library}"
+    done < <(find "${FRAMEWORKS_DIR}" -type f -print)
+
+    for executable in "${APP_EXECUTABLES[@]}"; do
+        codesign --force --sign - --timestamp=none "${executable}"
+    done
+
+    codesign --force --deep --sign - --timestamp=none "${APP_DIR}"
+fi

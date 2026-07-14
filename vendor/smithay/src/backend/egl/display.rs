@@ -314,7 +314,6 @@ impl EGLDisplay {
         wrap_egl_call_bool(|| unsafe { ffi::egl::BindAPI(ffi::egl::OPENGL_ES_API) })
             .map_err(|source| Error::OpenGlesNotSupported(Some(source)))?;
 
-
         Ok(EGLDisplay {
             display,
             surface_type,

@@ -757,8 +757,9 @@ impl GlesRenderer {
 
     #[cfg(target_os = "macos")]
     /// Creates a new OpenGL ES renderer from a given loader closure
-    pub unsafe fn new_with_loader<F>(loader: F) -> Result<GlesRenderer, GlesError> 
-    where F: FnMut(&str) -> *const std::ffi::c_void
+    pub unsafe fn new_with_loader<F>(loader: F) -> Result<GlesRenderer, GlesError>
+    where
+        F: FnMut(&str) -> *const std::ffi::c_void,
     {
         // MacOS external loader constructor
         let (gl, gl_version, exts, capabilities, gl_debug_span) = {
@@ -772,22 +773,20 @@ impl GlesRenderer {
                 vec![]
             };
 
-            let gl_version = version::GlVersion::try_from(&gl).unwrap_or_else(|_| {
-                version::GLES_2_0
-            });
+            let gl_version = version::GlVersion::try_from(&gl).unwrap_or_else(|_| version::GLES_2_0);
 
             // Assume capabilities for macOS 3.3+ core profile
             let capabilities = vec![
-                Capability::Instancing, 
-                Capability::Renderbuffer, 
-                Capability::Blit, 
+                Capability::Instancing,
+                Capability::Renderbuffer,
+                Capability::Blit,
                 Capability::_10Bit,
                 Capability::Fencing,
-                Capability::Debug
+                Capability::Debug,
             ];
             (gl, gl_version, exts, capabilities, None)
         };
-        
+
         let (sender, _receiver) = std::sync::mpsc::channel();
         let span = tracing::Span::none();
 
@@ -821,12 +820,13 @@ impl GlesRenderer {
 
         let egl = EGLContext::new_dummy(&EGLDisplay::new_dummy());
         egl.user_data().get_or_insert_threadsafe(GlesCleanup::default);
-        egl.user_data().insert_if_missing_threadsafe(ContextId::<GlesTexture>::new);
+        egl.user_data()
+            .insert_if_missing_threadsafe(ContextId::<GlesTexture>::new);
 
         let renderer = GlesRenderer {
             gl,
             egl,
-            
+
             #[cfg(all(feature = "wayland_frontend", feature = "use_system_lib"))]
             egl_reader: None,
 
@@ -852,7 +852,7 @@ impl GlesRenderer {
             span,
             gl_debug_span,
         };
-        
+
         Ok(renderer)
     }
 
@@ -990,14 +990,14 @@ impl ImportMemWl for GlesRenderer {
             let has_alpha = has_alpha(fourcc);
             let (mut internal_format, read_format, type_) =
                 fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnsupportedWlPixelFormat(data.format))?;
-            
+
             // PATCH: macOS Core Profile (3.3+) requires RGBA/RGBA8 internal format.
             // BGRA internal format is not supported (only BGRA *format* is supported for upload).
             #[cfg(target_os = "macos")]
             if internal_format == ffi::BGRA_EXT {
                 internal_format = ffi::RGBA8;
             }
-            
+
             if self.gl_version.major == 2 {
                 // es 2.0 doesn't define sized variants
                 internal_format = match internal_format {
@@ -1155,7 +1155,7 @@ impl ImportMem for GlesRenderer {
         let has_alpha = has_alpha(format);
         let (mut internal, format, layout) =
             fourcc_to_gl_formats(format).expect("We check the format before");
-            
+
         // PATCH: macOS Core Profile (3.3+) requires RGBA/RGBA8 internal format.
         #[cfg(target_os = "macos")]
         if internal == ffi::BGRA_EXT {
@@ -2640,7 +2640,7 @@ impl GlesFrame<'_, '_> {
             );
 
             gl.EnableVertexAttribArray(self.renderer.solid_program.attrib_position as u32);
-            
+
             // PATCH: macOS Core Profile requires VBOs (Client arrays not supported)
             let mut temp_vbo = 0;
             gl.GenBuffers(1, &mut temp_vbo);
@@ -2977,7 +2977,7 @@ impl GlesFrame<'_, '_> {
 
             // vert_position
             gl.EnableVertexAttribArray(program.attrib_vert_position as u32);
-            
+
             // PATCH: macOS Core Profile requires VBOs (Client arrays not supported)
             let mut temp_vbo = 0;
             gl.GenBuffers(1, &mut temp_vbo);

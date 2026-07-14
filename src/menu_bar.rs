@@ -8,19 +8,19 @@
 //!   - separator
 //!   - saved connections from ~/.config/cocoa-way/connections.toml
 
-use std::sync::mpsc::Sender;
 use std::sync::Mutex;
+use std::sync::mpsc::Sender;
 
 use objc2::declare_class;
 use objc2::mutability::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{msg_send, msg_send_id, sel, ClassType, DeclaredClass};
-use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
-use objc2_foundation::{MainThreadMarker, NSRect, NSString};
+use objc2::{ClassType, DeclaredClass, msg_send, msg_send_id, sel};
+use objc2_app_kit::{NSAlert, NSApplication, NSImage, NSMenu, NSMenuItem};
+use objc2_foundation::{MainThreadMarker, NSData, NSString};
 
 use crate::connections::Connection;
-use crate::container_sessions::{self, ContainerSession};
+use crate::container_sessions::ContainerSession;
 use crate::messages::CompositorMessage;
 
 // ── Global channel sender ─────────────────────────────────────────────────────
@@ -32,6 +32,10 @@ fn send(msg: CompositorMessage) {
             let _ = tx.send(msg);
         }
     }
+}
+
+fn sender() -> Option<Sender<CompositorMessage>> {
+    SENDER.lock().ok().and_then(|g| g.as_ref().cloned())
 }
 
 // ── ObjC handler class ────────────────────────────────────────────────────────
@@ -62,9 +66,19 @@ declare_class!(
             send(CompositorMessage::Connect(tag as usize));
         }
 
+        #[method(disconnectClassicConnections:)]
+        fn disconnect_classic_connections(&self, _sender: &AnyObject) {
+            send(CompositorMessage::DisconnectClassicConnections);
+        }
+
         #[method(openContainerMode:)]
         fn open_container_mode(&self, _sender: &AnyObject) {
-            unsafe { show_container_mode_dialog(); }
+            let Some(tx) = sender() else {
+                return;
+            };
+            // Menu actions are delivered on the main thread.
+            let mtm = unsafe { MainThreadMarker::new_unchecked() };
+            crate::container_mode::show(tx, mtm);
         }
 
         #[method(startContainerSession:)]
@@ -86,25 +100,27 @@ declare_class!(
 
 // ── Quick-connect dialog ──────────────────────────────────────────────────────
 
-/// Shows an NSAlert with two text fields: user@host and program.
-/// Blocks until dismissed. On "Connect", spawns waypipe.
+/// Shows a compact form for the same SSH path exposed by run_waypipe.sh.
+/// The connection is sent back to the compositor loop so its child is tracked.
 unsafe fn show_quick_connect_dialog() {
-    use objc2_app_kit::{NSAlert, NSSecureTextField, NSTextField, NSView};
+    use objc2_app_kit::{NSAlert, NSButton, NSSecureTextField, NSTextField, NSView};
     use objc2_foundation::NSRect;
+
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
 
     let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
     let _: () =
         msg_send![&*alert, setMessageText: &*NSString::from_str("Connect to Remote Machine")];
     let _: () = msg_send![&*alert, setInformativeText:
-        &*NSString::from_str("Enter the SSH host and the Wayland app to launch.")];
+        &*NSString::from_str("Enter the SSH host and Wayland app. Saved entries appear in Connections; passwords are never stored.")];
 
-    // Accessory view: 300×116 containing three text fields (host / password / app)
+    // Accessory view containing host, password, app, and an optional display slot.
     // NSView origin is bottom-left, so y increases upward.
     let frame = NSRect {
         origin: objc2_foundation::NSPoint { x: 0.0, y: 0.0 },
         size: objc2_foundation::NSSize {
-            width: 300.0,
-            height: 116.0,
+            width: 340.0,
+            height: 224.0,
         },
     };
     let view: Retained<NSView> = msg_send_id![
@@ -112,11 +128,26 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: frame
     ];
 
-    // Top field: user@host
-    let host_frame = NSRect {
-        origin: objc2_foundation::NSPoint { x: 0.0, y: 80.0 },
+    // Optional friendly name for a reusable connection.
+    let name_frame = NSRect {
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 188.0 },
         size: objc2_foundation::NSSize {
-            width: 300.0,
+            width: 340.0,
+            height: 28.0,
+        },
+    };
+    let name_field: Retained<NSTextField> = msg_send_id![
+        msg_send_id![NSTextField::class(), alloc],
+        initWithFrame: name_frame
+    ];
+    let _: () = msg_send![&*name_field, setPlaceholderString:
+        &*NSString::from_str("Connection name (defaults to user@host)")];
+
+    // SSH target: user@host
+    let host_frame = NSRect {
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 152.0 },
+        size: objc2_foundation::NSSize {
+            width: 340.0,
             height: 28.0,
         },
     };
@@ -129,9 +160,9 @@ unsafe fn show_quick_connect_dialog() {
 
     // Middle field: password (masked)
     let pass_frame = NSRect {
-        origin: objc2_foundation::NSPoint { x: 0.0, y: 44.0 },
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 116.0 },
         size: objc2_foundation::NSSize {
-            width: 300.0,
+            width: 340.0,
             height: 28.0,
         },
     };
@@ -144,9 +175,9 @@ unsafe fn show_quick_connect_dialog() {
 
     // Bottom field: app to launch
     let prog_frame = NSRect {
-        origin: objc2_foundation::NSPoint { x: 0.0, y: 8.0 },
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 80.0 },
         size: objc2_foundation::NSSize {
-            width: 300.0,
+            width: 340.0,
             height: 28.0,
         },
     };
@@ -155,11 +186,41 @@ unsafe fn show_quick_connect_dialog() {
         initWithFrame: prog_frame
     ];
     let _: () = msg_send![&*prog_field, setPlaceholderString:
-        &*NSString::from_str("App to launch (e.g. weston-terminal)")];
+        &*NSString::from_str("App to launch (e.g. niri or foot)")];
 
+    let display_frame = NSRect {
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 44.0 },
+        size: objc2_foundation::NSSize {
+            width: 340.0,
+            height: 28.0,
+        },
+    };
+    let display_field: Retained<NSTextField> = msg_send_id![
+        msg_send_id![NSTextField::class(), alloc],
+        initWithFrame: display_frame
+    ];
+    let _: () = msg_send![&*display_field, setPlaceholderString:
+        &*NSString::from_str("Display slot (blank or default; e.g. display-1)")];
+
+    let save_button = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Save this connection for later"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    let _: () = msg_send![&*save_button, setFrame: NSRect {
+        origin: objc2_foundation::NSPoint { x: 0.0, y: 4.0 },
+        size: objc2_foundation::NSSize { width: 340.0, height: 28.0 },
+    }];
+
+    let _: () = msg_send![&*view, addSubview: &*name_field];
     let _: () = msg_send![&*view, addSubview: &*host_field];
     let _: () = msg_send![&*view, addSubview: &*pass_field];
     let _: () = msg_send![&*view, addSubview: &*prog_field];
+    let _: () = msg_send![&*view, addSubview: &*display_field];
+    let _: () = msg_send![&*view, addSubview: &*save_button];
     let _: () = msg_send![&*alert, setAccessoryView: &*view];
 
     let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
@@ -169,16 +230,21 @@ unsafe fn show_quick_connect_dialog() {
 
     // Make the first field the initial responder
     let _: () = msg_send![&*alert, layout];
-    let win: Retained<NSObject> = msg_send_id![&*alert, window];
+    let _win: Retained<NSObject> = msg_send_id![&*alert, window];
     let response: isize = msg_send![&*alert, runModal];
     // NSAlertFirstButtonReturn = 1000
     if response == 1000 {
+        let name_ns: Retained<NSString> = msg_send_id![&*name_field, stringValue];
         let host_ns: Retained<NSString> = msg_send_id![&*host_field, stringValue];
         let pass_ns: Retained<NSString> = msg_send_id![&*pass_field, stringValue];
         let prog_ns: Retained<NSString> = msg_send_id![&*prog_field, stringValue];
-        let host_str = host_ns.to_string();
+        let display_ns: Retained<NSString> = msg_send_id![&*display_field, stringValue];
+        let name_str = name_ns.to_string().trim().to_string();
+        let host_str = host_ns.to_string().trim().to_string();
         let pass_str = pass_ns.to_string();
-        let prog_str = prog_ns.to_string();
+        let prog_str = prog_ns.to_string().trim().to_string();
+        let display_str = display_ns.to_string().trim().to_string();
+        let save_state: isize = msg_send![&*save_button, state];
         if !host_str.is_empty() {
             let (user, host_addr) = if let Some(idx) = host_str.find('@') {
                 (
@@ -190,7 +256,11 @@ unsafe fn show_quick_connect_dialog() {
             };
             log::info!("Quick-connect: {} app={}", host_str, prog_str);
             let conn = crate::connections::Connection {
-                name: host_str,
+                name: if name_str.is_empty() {
+                    host_str
+                } else {
+                    name_str
+                },
                 conn_type: "ssh".to_string(),
                 host: Some(host_addr),
                 user,
@@ -202,6 +272,12 @@ unsafe fn show_quick_connect_dialog() {
                 } else {
                     Some(prog_str)
                 },
+                display: if display_str.is_empty() {
+                    None
+                } else {
+                    Some(display_str)
+                },
+                compression: None,
                 password: if pass_str.is_empty() {
                     None
                 } else {
@@ -209,55 +285,62 @@ unsafe fn show_quick_connect_dialog() {
                 },
                 waypipe_path: None,
             };
-            let rt = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-            let disp = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-            crate::connections::spawn_waypipe(&conn, &rt, &disp);
+            if save_state == 1 {
+                match crate::connections::save_connection(&conn) {
+                    Ok(_) => {
+                        log::info!("Saved connection '{}'", conn.name);
+                        send(CompositorMessage::ReloadMenu);
+                    }
+                    Err(error) => show_connection_save_error(&error, mtm),
+                }
+            }
+            send(CompositorMessage::ConnectMachine(conn));
+        } else {
+            show_connection_error("Enter a hostname or IP address.", mtm);
         }
     }
 }
 
-unsafe fn show_container_mode_dialog() {
-    use objc2_app_kit::NSAlert;
+pub fn show_connection_error(message: &str, mtm: MainThreadMarker) {
+    unsafe {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Connection Failed"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("OK"));
+        alert.runModal();
+    }
+}
 
-    let sessions = container_sessions::load_sessions();
-    let config_path = container_sessions::config_path();
-    let details = if sessions.is_empty() {
-        format!(
-            "No container sessions are configured yet.\n\nEdit:\n{}",
-            config_path.display()
-        )
-    } else {
-        let names = sessions
-            .iter()
-            .map(|session| format!("• {}", session.name))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!(
-            "Configured sessions:\n{}\n\nEdit:\n{}",
-            names,
-            config_path.display()
-        )
-    };
+fn show_connection_save_error(message: &str, mtm: MainThreadMarker) {
+    unsafe {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Could Not Save Connection"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("Continue Without Saving"));
+        alert.runModal();
+    }
+}
 
-    let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
-    let _: () = msg_send![&*alert, setMessageText:
-        &*NSString::from_str("Container Mode")];
-    let _: () = msg_send![&*alert, setInformativeText:
-        &*NSString::from_str(&details)];
-    let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
-        &*NSString::from_str("OK")];
-    let _: isize = msg_send![&*alert, runModal];
+fn install_application_icon(app: &NSApplication, mtm: MainThreadMarker) {
+    static ICON: &[u8] = include_bytes!("../assets/icon.png");
+    let data = NSData::with_bytes(ICON);
+    match NSImage::initWithData(mtm.alloc::<NSImage>(), &data) {
+        Some(icon) => unsafe { app.setApplicationIconImage(Some(&icon)) },
+        None => log::warn!("Failed to decode the embedded Cocoa-Way app icon"),
+    }
 }
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
 unsafe fn label_item(title: &str, mtm: MainThreadMarker) -> Retained<NSMenuItem> {
-    NSMenuItem::initWithTitle_action_keyEquivalent(
-        mtm.alloc::<NSMenuItem>(),
-        &NSString::from_str(title),
-        None,
-        &NSString::from_str(""),
-    )
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str(title),
+            None,
+            &NSString::from_str(""),
+        )
+    }
 }
 
 // ── Public setup ──────────────────────────────────────────────────────────────
@@ -276,6 +359,7 @@ pub fn setup_menu(
         let handler: Retained<MenuHandler> = msg_send_id![MenuHandler::class(), new];
 
         let app = NSApplication::sharedApplication(mtm);
+        install_application_icon(&app, mtm);
         let root = NSMenu::new(mtm);
 
         // ── 1. App menu ("Cocoa-Way") ─────────────────────────────────────────
@@ -325,6 +409,15 @@ pub fn setup_menu(
                 conn_menu.addItem(&item);
             }
         }
+        conn_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        let disconnect = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str("Disconnect Classic Connections"),
+            Some(sel!(disconnectClassicConnections:)),
+            &NSString::from_str(""),
+        );
+        let _: () = msg_send![&*disconnect, setTarget: &*handler];
+        conn_menu.addItem(&disconnect);
         conn_item.setSubmenu(Some(&conn_menu));
         root.addItem(&conn_item);
 

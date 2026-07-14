@@ -29,45 +29,44 @@ pub unsafe fn compile_shader(
         return Err(GlesError::CreateShaderObject);
     }
 
-
-
     #[cfg(target_os = "macos")]
     let src_string = if src.contains("#version 100") || src.contains("#version 300 es") {
         let mut s = src.to_string();
-        
+
         let is_vert = s.contains("attribute "); // Heuristic: only VS has attributes in this codebase.
 
         // 1. Version & Precision
-        s = s.replace("#version 100", "#version 330 core")
-             .replace("#version 300 es", "#version 330 core")
-             .replace("precision mediump float;", "// precision mediump float;")
-             .replace("precision highp float;", "// precision highp float;")
-             .replace("precision lowp float;", "// precision lowp float;");
+        s = s
+            .replace("#version 100", "#version 330 core")
+            .replace("#version 300 es", "#version 330 core")
+            .replace("precision mediump float;", "// precision mediump float;")
+            .replace("precision highp float;", "// precision highp float;")
+            .replace("precision lowp float;", "// precision lowp float;");
 
         // 2. Keywords
         if is_vert {
             // Vertex Shader
             // attribute -> in
             // varying -> out
-            s = s.replace("attribute ", "in ")
-                 .replace("varying ", "out ");
+            s = s.replace("attribute ", "in ").replace("varying ", "out ");
         } else {
             // Fragment Shader
             // varying -> in
             s = s.replace("varying ", "in ");
-            
+
             // Handle Output
             // gl_FragColor -> fragColor
             if s.contains("gl_FragColor") {
-                s = s.replace("void main() {", "out vec4 fragColor;\nvoid main() {")
-                     .replace("gl_FragColor", "fragColor");
+                s = s
+                    .replace("void main() {", "out vec4 fragColor;\nvoid main() {")
+                    .replace("gl_FragColor", "fragColor");
             }
         }
-        
+
         // 3. Functions
         // texture2D -> texture
         s = s.replace("texture2D", "texture");
-        
+
         // 4. Uniforms
         // samplerExternalOES -> sampler2D (already patched in file, but careful)
         // If file still has samplerExternalOES, replace it.
@@ -77,7 +76,7 @@ pub unsafe fn compile_shader(
     } else {
         src.to_string()
     };
-    
+
     #[cfg(not(target_os = "macos"))]
     let src_string = src.to_string();
 
@@ -107,7 +106,7 @@ pub unsafe fn compile_shader(
             error.as_mut_ptr() as *mut _,
         );
         error.set_len(len as usize);
-        
+
         let err_msg = std::str::from_utf8(&error).unwrap_or("<Error Message no utf8>");
         error!("[GL] Shader Error: {}", err_msg);
         // Print usage for debugging
