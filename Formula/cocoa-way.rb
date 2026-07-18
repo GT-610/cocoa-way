@@ -1,8 +1,8 @@
 class CocoaWay < Formula
   desc "Native macOS Wayland compositor for running Linux apps"
   homepage "https://github.com/J-x-Z/cocoa-way"
-  url "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.0.0.tar.gz"
-  sha256 "496f6dfed0fcdf5e50a91969e87d1933a5e13c38159056b726e2c386bb8923bd"
+  url "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.0.1.tar.gz"
+  sha256 "83a94f1317b181f756a6c7b2d710e8a76c776bca7081feb6405e313e841eac72"
   license "GPL-3.0-only"
   head "https://github.com/J-x-Z/cocoa-way.git", branch: "main"
 
