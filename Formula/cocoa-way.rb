@@ -1,26 +1,25 @@
 class CocoaWay < Formula
   desc "Native macOS Wayland compositor for running Linux apps"
   homepage "https://github.com/J-x-Z/cocoa-way"
-  url "https://github.com/J-x-Z/cocoa-way.git", tag: "v1.0.0"
-  sha256 "3f79550d2f5cd4e0e40db983236843d19818127a0e5eaba56baa6519afdab722"
+  url "https://github.com/J-x-Z/cocoa-way/archive/refs/tags/v2.0.0.tar.gz"
+  sha256 "496f6dfed0fcdf5e50a91969e87d1933a5e13c38159056b726e2c386bb8923bd"
   license "GPL-3.0-only"
   head "https://github.com/J-x-Z/cocoa-way.git", branch: "main"
 
-  depends_on "rust" => :build
   depends_on "pkg-config" => :build
+  depends_on "rust" => :build
   depends_on "libxkbcommon"
-  depends_on "pixman"
   depends_on :macos
+  depends_on "pixman"
 
   def install
-    system "cargo", "build", "--release"
-    bin.install "target/release/cocoa-way"
+    system "cargo", "install", *std_cargo_args
   end
 
   def caveats
     <<~EOS
-      Cocoa-Way is a Wayland compositor for running Linux GUI apps on macOS.
-      
+      Cocoa-Way runs Linux GUI applications and container desktops on macOS.
+
       Quick start:
         1. Start the compositor:
            cocoa-way
@@ -34,7 +33,8 @@ class CocoaWay < Formula
   end
 
   test do
-    # Basic smoke test - check binary runs
-    assert_match "cocoa-way", shell_output("#{bin}/cocoa-way --help 2>&1", 2)
+    assert_match "cocoa-way", shell_output("#{bin}/cocoa-way --help 2>&1")
+    assert_match "applications", shell_output("#{bin}/cocoa-wayctl --help")
+    assert_predicate bin/"cocoa-way-mcp", :executable?
   end
 end
