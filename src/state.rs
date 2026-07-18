@@ -193,7 +193,7 @@ impl AppState {
         presentation: crate::presentation::PresentationMode,
         width: u32,
         height: u32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let compositor_state = CompositorState::new::<Self>(display_handle);
         let xdg_shell_state = XdgShellState::new::<Self>(display_handle);
         let shm_state = ShmState::new::<Self>(
@@ -218,7 +218,11 @@ impl AppState {
             variant: "",
             options: None,
         };
-        seat.add_keyboard(xkb_config, 600, 50).unwrap();
+        seat.add_keyboard(xkb_config, 600, 50).map_err(|error| {
+            format!(
+                "failed to initialize the Wayland keyboard keymap: {error:?}. Check XKB_CONFIG_ROOT or reinstall Cocoa-Way"
+            )
+        })?;
         seat.add_pointer();
         let output_state = smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(
             display_handle,
@@ -246,7 +250,7 @@ impl AppState {
             Some((0, 0).into()),
         );
         output.set_preferred(mode);
-        Self {
+        Ok(Self {
             display_handle: display_handle.clone(),
             compositor_state,
             xdg_shell_state,
@@ -309,7 +313,7 @@ impl AppState {
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
             pointer_gesture: PointerGestureTracker::default(),
             pointer_axis: PointerAxisTracker::default(),
-        }
+        })
     }
 
     pub fn handle_pointer_axis(

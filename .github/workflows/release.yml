@@ -85,6 +85,9 @@ jobs:
 
       - name: Verify bundled dylibs
         run: |
+          test -f Cocoa-Way.app/Contents/Resources/xkb/rules/evdev
+          test -f Cocoa-Way.app/Contents/Resources/xkb/keycodes/evdev
+          test -f Cocoa-Way.app/Contents/Resources/xkb/symbols/us
           for executable in cocoa-way cocoa-wayctl cocoa-way-mcp; do
             ! otool -L "Cocoa-Way.app/Contents/MacOS/${executable}" | grep -E '/(opt/homebrew|usr/local|nix)/'
           done

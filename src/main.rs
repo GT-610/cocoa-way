@@ -2677,6 +2677,9 @@ fn main() {
         "cocoa_way=info,smithay=warn,wayland_server=warn,wayland_client=warn".into()
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    if let Err(error) = runtime_paths::configure_xkb_config_root() {
+        log::error!("{error}");
+    }
     if std::env::var_os(DISPLAY_WORKER_SLOT_ENV).is_none() {
         cleanup_stale_display_runtime_dirs();
     }
@@ -2689,7 +2692,17 @@ fn main() {
                 if !matches!(event, Event::Resumed) {
                     return;
                 }
-                event_handler = Some(create_event_handler(target));
+                match create_event_handler(target) {
+                    Ok(handler) => event_handler = Some(handler),
+                    Err(error) => {
+                        log::error!("Cocoa-Way startup failed: {error}");
+                        // SAFETY: Resumed is delivered on the AppKit main thread.
+                        let mtm = unsafe { objc2_foundation::MainThreadMarker::new_unchecked() };
+                        menu_bar::show_startup_error(&error, mtm);
+                        target.exit();
+                        return;
+                    }
+                }
             }
             if let Some(handler) = event_handler.as_mut() {
                 handler(event, target);
@@ -3118,7 +3131,7 @@ fn rootless_pointer_button(
 
 fn create_event_handler(
     target: &ActiveEventLoop,
-) -> impl FnMut(Event<()>, &ActiveEventLoop) + use<> {
+) -> Result<impl FnMut(Event<()>, &ActiveEventLoop) + use<>, String> {
     let presentation_mode = presentation::PresentationMode::from_env();
     let display_worker_slot = std::env::var(DISPLAY_WORKER_SLOT_ENV).ok();
     let display_worker_parent = std::env::var(DISPLAY_WORKER_PARENT_ENV)
@@ -3136,14 +3149,15 @@ fn create_event_handler(
         .with_inner_size(winit::dpi::LogicalSize::new(800.0f64, 600.0f64));
     let window = target
         .create_window(window_attributes)
-        .expect("Failed to create window");
-    let mut renderer =
-        metal_renderer::MetalRenderer::new(window).expect("Failed to create MetalRenderer");
+        .map_err(|error| format!("failed to create the Cocoa-Way window: {error}"))?;
+    let mut renderer = metal_renderer::MetalRenderer::new(window)
+        .map_err(|error| format!("failed to initialize Metal rendering: {error}"))?;
     if let Err(error) = macos_gestures::install_swipe_recognizer(&renderer.window) {
         log::warn!("Three-finger swipe support is unavailable: {}", error);
     }
     info!("MetalRenderer created with Metal hardware rendering");
-    let mut display = Display::<AppState>::new().unwrap();
+    let mut display = Display::<AppState>::new()
+        .map_err(|error| format!("failed to initialize the Wayland display: {error}"))?;
     let display_handle = display.handle();
     let (loop_signal, loop_receiver) = std::sync::mpsc::channel::<CompositorMessage>();
     let control_socket_path = if display_worker_slot.is_none() {
@@ -3173,7 +3187,8 @@ fn create_event_handler(
         presentation_mode,
         renderer.window.inner_size().width,
         renderer.window.inner_size().height,
-    );
+    )
+    .map_err(|error| format!("Cocoa-Way input initialization failed: {error}"))?;
     let initial_size = renderer.window.inner_size();
     let (initial_width, initial_height) = layout::sanitize_logical_size(
         f64::from(initial_size.width),
@@ -3194,15 +3209,25 @@ fn create_event_handler(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("cocoa-way"));
     if !runtime_dir.exists() {
-        std::fs::create_dir_all(&runtime_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).map_err(|error| {
+            format!(
+                "failed to create the Wayland runtime directory '{}': {error}",
+                runtime_dir.display()
+            )
+        })?;
     }
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
     }
-    let listener = ListeningSocket::bind_auto("wayland", 1..10).unwrap();
+    let listener = ListeningSocket::bind_auto("wayland", 1..10).map_err(|error| {
+        format!(
+            "failed to create a Wayland socket in '{}': {error}",
+            runtime_dir.display()
+        )
+    })?;
     let socket_name = listener
         .socket_name()
-        .unwrap()
+        .ok_or_else(|| "the Wayland listener did not publish a socket name".to_string())?
         .to_string_lossy()
         .into_owned();
     info!("Wayland socket created: {:?}", socket_name);
@@ -3231,14 +3256,14 @@ fn create_event_handler(
                 Ok(Some(stream)) => {
                     use crate::state::ClientState;
                     info!("New client connected");
-                    loop_handle
-                        .insert_client(
-                            stream,
-                            Arc::new(ClientState {
-                                compositor_state: Default::default(),
-                            }),
-                        )
-                        .unwrap();
+                    if let Err(error) = loop_handle.insert_client(
+                        stream,
+                        Arc::new(ClientState {
+                            compositor_state: Default::default(),
+                        }),
+                    ) {
+                        log::warn!("Could not register a Wayland client: {error}");
+                    }
                 }
                 Ok(None) => {
                     // The Wayland listening socket is non-blocking. Without a small
@@ -3296,7 +3321,7 @@ fn create_event_handler(
     let mut pending_input_sample: Option<(std::time::Instant, u64)> = None;
     let mut input_to_present_ms: Option<f64> = None;
     let mut last_parent_check = std::time::Instant::now();
-    move |event, target| {
+    Ok(move |event: Event<()>, target: &ActiveEventLoop| {
         for gesture in macos_gestures::drain_swipe_events() {
             let time = start_time.elapsed().as_millis() as u32;
             if macos_gestures::window_number(&renderer.window) == Some(gesture.window_number) {
@@ -5288,5 +5313,5 @@ fn create_event_handler(
             }
             _ => {}
         }
-    }
+    })
 }

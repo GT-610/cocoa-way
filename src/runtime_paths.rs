@@ -1,6 +1,59 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+const XKB_CONFIG_ROOT_ENV: &str = "XKB_CONFIG_ROOT";
+
+pub(crate) fn configure_xkb_config_root() -> Result<PathBuf, String> {
+    let configured = std::env::var_os(XKB_CONFIG_ROOT_ENV).map(PathBuf::from);
+    if let Some(root) = configured
+        .as_deref()
+        .filter(|root| is_xkb_config_root(root))
+    {
+        log::info!("Using XKB configuration from {}", root.display());
+        return Ok(root.to_path_buf());
+    }
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate the Cocoa-Way executable: {error}"))?;
+    let mut candidates = Vec::new();
+    if let Some(root) = bundled_xkb_config_root_for(&executable) {
+        candidates.push(root);
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/share/X11/xkb"),
+        PathBuf::from("/usr/local/share/X11/xkb"),
+        PathBuf::from("/usr/share/X11/xkb"),
+        PathBuf::from("/run/current-system/sw/share/X11/xkb"),
+        PathBuf::from("/nix/var/nix/profiles/default/share/X11/xkb"),
+    ]);
+
+    if let Some(root) = candidates.into_iter().find(|root| is_xkb_config_root(root)) {
+        // SAFETY: this runs on the main thread before xkbcommon or child processes
+        // are initialized.
+        unsafe { std::env::set_var(XKB_CONFIG_ROOT_ENV, &root) };
+        log::info!("Using XKB configuration from {}", root.display());
+        return Ok(root);
+    }
+
+    let configured = configured
+        .map(|path| format!(" The configured path '{}' is incomplete.", path.display()))
+        .unwrap_or_default();
+    Err(format!(
+        "Cocoa-Way could not find xkeyboard-config data.{configured} Reinstall the app or install xkeyboard-config."
+    ))
+}
+
+fn bundled_xkb_config_root_for(executable: &Path) -> Option<PathBuf> {
+    let contents = executable.parent()?.parent()?;
+    Some(contents.join("Resources/xkb"))
+}
+
+fn is_xkb_config_root(path: &Path) -> bool {
+    path.join("rules/evdev").is_file()
+        && path.join("keycodes/evdev").is_file()
+        && path.join("symbols/us").is_file()
+}
+
 pub(crate) fn resolve_command_path(
     name: &str,
     configured: Option<&str>,
@@ -136,4 +189,28 @@ fn is_executable_file(path: &Path) -> bool {
     };
 
     metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_xkb_data_next_to_an_app_executable() {
+        let executable = Path::new("/Applications/Cocoa-Way.app/Contents/MacOS/cocoa-way");
+        assert_eq!(
+            bundled_xkb_config_root_for(executable),
+            Some(PathBuf::from(
+                "/Applications/Cocoa-Way.app/Contents/Resources/xkb"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_xkb_data() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        std::fs::create_dir_all(directory.path().join("rules")).expect("rules directory");
+        std::fs::write(directory.path().join("rules/evdev"), "rules").expect("rules file");
+        assert!(!is_xkb_config_root(directory.path()));
+    }
 }

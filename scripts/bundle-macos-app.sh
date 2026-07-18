@@ -9,13 +9,51 @@ fi
 APP_DIR=$1
 MAIN_BIN="${APP_DIR}/Contents/MacOS/cocoa-way"
 FRAMEWORKS_DIR="${APP_DIR}/Contents/Frameworks"
+RESOURCES_DIR="${APP_DIR}/Contents/Resources"
 
 if [[ ! -f "${MAIN_BIN}" ]]; then
     echo "error: missing app executable at ${MAIN_BIN}" >&2
     exit 1
 fi
 
-mkdir -p "${FRAMEWORKS_DIR}"
+mkdir -p "${FRAMEWORKS_DIR}" "${RESOURCES_DIR}"
+
+find_xkb_config_root() {
+    local candidate
+    local pkg_config_root=""
+
+    if command -v pkg-config >/dev/null 2>&1; then
+        pkg_config_root=$(pkg-config --variable=xkb_base xkeyboard-config 2>/dev/null || true)
+    fi
+
+    for candidate in \
+        "${XKB_CONFIG_ROOT:-}" \
+        "${pkg_config_root}" \
+        /opt/homebrew/share/X11/xkb \
+        /usr/local/share/X11/xkb \
+        /usr/share/X11/xkb; do
+        if [[ -n "${candidate}" && -f "${candidate}/rules/evdev" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+XKB_ROOT=$(find_xkb_config_root || true)
+if [[ -z "${XKB_ROOT}" ]]; then
+    echo "error: xkeyboard-config data was not found" >&2
+    exit 1
+fi
+
+rm -rf "${RESOURCES_DIR}/xkb"
+mkdir -p "${RESOURCES_DIR}/xkb"
+cp -R "${XKB_ROOT}/." "${RESOURCES_DIR}/xkb/"
+if [[ ! -f "${RESOURCES_DIR}/xkb/rules/evdev" ]]; then
+    echo "error: failed to bundle xkeyboard-config rules" >&2
+    exit 1
+fi
 
 APP_EXECUTABLES=("${MAIN_BIN}")
 for helper in cocoa-wayctl cocoa-way-mcp; do

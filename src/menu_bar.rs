@@ -316,6 +316,16 @@ pub fn show_connection_error(message: &str, mtm: MainThreadMarker) {
     }
 }
 
+pub fn show_startup_error(message: &str, mtm: MainThreadMarker) {
+    unsafe {
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str("Cocoa-Way Could Not Start"));
+        alert.setInformativeText(&NSString::from_str(message));
+        alert.addButtonWithTitle(&NSString::from_str("Quit"));
+        alert.runModal();
+    }
+}
+
 fn show_connection_save_error(message: &str, mtm: MainThreadMarker) {
     unsafe {
         let alert = NSAlert::new(mtm);
