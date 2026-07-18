@@ -8,13 +8,14 @@ description: Guide a new Cocoa-Way user through choosing an image source, creati
 Keep setup local, reviewable, and reversible.
 
 1. Call `cocoa_way_onboarding` with the user's goal.
-2. For Apple Container, call `cocoa_way_image_sources`, then `cocoa_way_application_template` with the chosen image and command.
-3. Explain that a base OCI image is not automatically GUI-ready. It needs Waypipe and the requested GUI command; clipboard and audio need the Cocoa-Way image helpers.
-4. Ask the user to review the generated fields in Applications > New Application, run Check, and launch explicitly.
-5. Use `desktop` for nested compositors such as niri or Hyprland. Use `rootless` for ordinary xdg-shell apps such as Foot or Firefox.
-6. For SSH or an existing local Waypipe socket, call `cocoa_way_connection_template`. Save the reviewed fields through Connections > Connect to Machine or run the generated `run_waypipe.sh` command.
-7. Create or select a managed Display before connecting when the default display is occupied.
-8. If setup fails, switch to the `cocoa-way-diagnose` workflow and collect evidence before changing configuration.
+2. For Apple Container, confirm that Apple's separate `container` runtime is installed. If it is missing, direct the user to `https://github.com/apple/container/releases/latest`; if it is stopped, direct the user to Container > Apple Container > Start System.
+3. Call `cocoa_way_image_sources`, then `cocoa_way_application_template` with the chosen image and command.
+4. Explain that a base OCI image is not automatically GUI-ready. It needs Waypipe and the requested GUI command; clipboard and audio need the Cocoa-Way image helpers.
+5. Ask the user to review the generated fields in Applications > New Application, run Check, and launch explicitly.
+6. Use `desktop` for nested compositors such as niri or Hyprland. Use `rootless` for ordinary xdg-shell apps such as Foot or Firefox.
+7. For SSH or an existing local Waypipe socket, call `cocoa_way_connection_template`. Save the reviewed fields through Connections > Connect to Machine or run the generated `run_waypipe.sh` command.
+8. Create or select a managed Display before connecting when the default display is occupied.
+9. If setup fails, switch to the `cocoa-way-diagnose` workflow and collect evidence before changing configuration.
 
 ## Safety
 

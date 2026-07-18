@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-2.0.1-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
@@ -49,6 +49,23 @@ This keeps classic SSH and local-socket workflows available while making Apple C
 
 ## Installation
 
+### Apple Container (for managed local applications)
+
+Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. Apple officially supports it on Apple silicon with macOS 26; see its [current requirements](https://github.com/apple/container#requirements). Install it before using Cocoa-Way's managed local application workflow:
+
+1. Download and install the [latest official Apple Container release](https://github.com/apple/container/releases/latest).
+2. Open Cocoa-Way and select **Container > Apple Container**.
+3. Use **Start System**, then confirm that the Compatibility card reports a running service.
+
+Apple Container 1.0 is supported through a compatibility fallback, but version 1.1 or newer is recommended for the non-root published Unix sockets used by Transport V2. You can verify the runtime manually with:
+
+```bash
+container system start
+container system status
+```
+
+This runtime is optional when Cocoa-Way is used only with SSH, Docker, OrbStack, or an existing local Waypipe socket.
+
 ### Homebrew
 
 ```bash
@@ -89,11 +106,12 @@ The script also supports local Waypipe/socket workflows and remains independent 
 
 For a local Apple Container application:
 
-1. Open **Container > Applications**.
-2. Use **Images** to pull/import an OCI image or build the bundled GUI-ready example.
-3. Create an application, choose Desktop or Rootless presentation, and leave Display on Auto unless a stable slot is required.
-4. Run **Check**, then **Launch**.
-5. Inspect instance status, logs, terminal, files, audio, display assignment, and resource diagnostics in the same panel.
+1. Install Apple Container separately, then open **Container > Apple Container** to start and validate it. If it is missing, Cocoa-Way links to Apple's official release page.
+2. Open **Container > Applications**.
+3. Use **Images** to pull/import an OCI image or build the bundled GUI-ready example.
+4. Create an application, choose Desktop or Rootless presentation, and leave Display on Auto unless a stable slot is required.
+5. Run **Check**, then **Launch**.
+6. Inspect instance status, logs, terminal, files, audio, display assignment, and resource diagnostics in the same panel.
 
 ## Presentation modes
 

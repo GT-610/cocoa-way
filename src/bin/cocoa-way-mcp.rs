@@ -404,6 +404,7 @@ fn onboarding(arguments: &Value, socket: &Path) -> Result<Value, String> {
     let applications = control_data(socket, "applications")?;
     let next_tools = match goal {
         "apple-container" => vec![
+            "Confirm Apple's separate Container runtime is installed. If it is missing, install the latest official release from https://github.com/apple/container/releases/latest, then start it from Container > Apple Container.",
             "Call cocoa_way_image_sources and choose a trusted GUI-ready image path.",
             "Call cocoa_way_application_template with the image and application command.",
             "Review the generated profile in Applications > New Application, run Check, then launch explicitly.",

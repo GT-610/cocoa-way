@@ -83,6 +83,7 @@ static TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const UI_COMMAND_CACHE_TTL: Duration = Duration::from_secs(10);
 const UI_COMMAND_LOADING: &str = "Loading runtime data...";
+const APPLE_CONTAINER_RELEASES_URL: &str = "https://github.com/apple/container/releases/latest";
 
 const NAV_SESSIONS: usize = 0;
 const NAV_IMAGES: usize = 1;
@@ -4634,6 +4635,21 @@ declare_class!(
             unsafe { rebuild_window(); }
         }
 
+        #[method(openAppleContainerReleases:)]
+        fn open_apple_container_releases(&self, _sender: &AnyObject) {
+            match std::process::Command::new("open")
+                .arg(APPLE_CONTAINER_RELEASES_URL)
+                .spawn()
+            {
+                Ok(_) => push_activity("Opened the official Apple Container release page.".into()),
+                Err(error) => show_error_alert(&format!(
+                    "Could not open the Apple Container release page: {}",
+                    error
+                )),
+            }
+            unsafe { rebuild_window(); }
+        }
+
         #[method(openOrbStackApp:)]
         fn open_orbstack_app(&self, _sender: &AnyObject) {
             match std::process::Command::new("open")
@@ -6619,6 +6635,8 @@ fn add_runtime_list(
         },
     };
 
+    let child_path = build_child_path();
+    let command_path = find_command_path(runtime.command, &child_path);
     let mut y = content_height - 58.0;
     add_label(
         parent,
@@ -6628,7 +6646,7 @@ fn add_runtime_list(
         TextStyle::Title,
     );
     add_runtime_accent(parent, selected_nav, rect(24.0, y + 2.0, 4.0, 24.0), mtm);
-    if selected_nav == NAV_APPLE_CONTAINER {
+    if selected_nav == NAV_APPLE_CONTAINER && command_path.is_some() {
         let open = add_button(
             parent,
             "Open Data Root",
@@ -6644,16 +6662,17 @@ fn add_runtime_list(
     }
     y -= 42.0;
 
-    let child_path = build_child_path();
-    let Some(command_path) = find_command_path(runtime.command, &child_path) else {
+    let Some(command_path) = command_path else {
         let is_orbstack = selected_nav == NAV_ORBSTACK;
+        let is_apple_container = selected_nav == NAV_APPLE_CONTAINER;
+        let has_install_action = is_orbstack || is_apple_container;
         add_card(
             parent,
             rect(
                 24.0,
-                y - if is_orbstack { 112.0 } else { 78.0 },
+                y - if has_install_action { 112.0 } else { 78.0 },
                 width - 48.0,
-                if is_orbstack { 142.0 } else { 108.0 },
+                if has_install_action { 142.0 } else { 108.0 },
             ),
             mtm,
         );
@@ -6666,6 +6685,9 @@ fn add_runtime_list(
         );
         let missing_detail = if is_orbstack {
             "OrbStack's CLI was not found. Open OrbStack once or use the Docker page with an OrbStack context."
+                .to_string()
+        } else if is_apple_container {
+            "Apple Container is a separate Apple runtime and is not bundled with Cocoa-Way. Install Apple's latest official release, then return here to start it."
                 .to_string()
         } else {
             format!("Command `{}` was not found in PATH.", runtime.command)
@@ -6689,6 +6711,19 @@ fn add_runtime_list(
             unsafe {
                 let _: () = msg_send![&*open, setToolTip:
                     &*NSString::from_str("Open OrbStack so its CLI and Docker endpoint become available")];
+            }
+        } else if is_apple_container {
+            let download = add_button(
+                parent,
+                "Get Apple Container",
+                rect(38.0, y - 76.0, 154.0, 28.0),
+                handler,
+                sel!(openAppleContainerReleases:),
+                mtm,
+            );
+            unsafe {
+                let _: () = msg_send![&*download, setToolTip:
+                    &*NSString::from_str("Open Apple's official latest Apple Container release")];
             }
         }
         return;
@@ -6941,12 +6976,12 @@ fn add_apple_container_system_controls(
         sel!(copyContainerCommand:),
         mtm,
     );
-    let open = add_button(
+    let releases = add_button(
         parent,
-        "Open Data",
+        "Latest Release",
         rect(152.0, y - 92.0, 104.0, 28.0),
         handler,
-        sel!(openAppleContainerDataRoot:),
+        sel!(openAppleContainerReleases:),
         mtm,
     );
     unsafe {
@@ -6957,8 +6992,8 @@ fn add_apple_container_system_controls(
         let _: () = msg_send![&*status, setTag: 0isize];
         let _: () = msg_send![&*status, setToolTip:
             &*NSString::from_str("Copy `container system status` to the clipboard")];
-        let _: () = msg_send![&*open, setToolTip:
-            &*NSString::from_str("Open Apple Container's local data root in Finder")];
+        let _: () = msg_send![&*releases, setToolTip:
+            &*NSString::from_str("Open Apple's official latest Apple Container release")];
         let transitioning = matches!(
             runtime_status,
             RuntimeStatus::Starting | RuntimeStatus::Stopping
