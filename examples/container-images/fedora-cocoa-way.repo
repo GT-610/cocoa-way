@@ -1,0 +1,17 @@
+[cocoa-way-fedora]
+name=Fedora 44 - Cocoa-Way mirror
+baseurl=http://mirrors.ustc.edu.cn/fedora/releases/44/Everything/$basearch/os/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-$basearch
+metadata_expire=6h
+
+[cocoa-way-updates]
+name=Fedora 44 Updates - Cocoa-Way mirror
+baseurl=http://mirrors.ustc.edu.cn/fedora/updates/44/Everything/$basearch/
+enabled=1
+gpgcheck=1
+repo_gpgcheck=0
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-$basearch
+metadata_expire=1h

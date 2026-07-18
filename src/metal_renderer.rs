@@ -84,6 +84,16 @@ struct CachedTexture {
     buffer_id: ObjectId,
     tex_w: i32,
     tex_h: i32,
+    dest_w: i32,
+    dest_h: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BufferDamage {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 pub struct MetalRenderer {
@@ -267,6 +277,13 @@ impl MetalRenderer {
         self.texture_cache.borrow_mut().remove(surface_id);
     }
 
+    pub fn cached_surface_size(&self, surface_id: &ObjectId) -> Option<(i32, i32)> {
+        self.texture_cache
+            .borrow()
+            .get(surface_id)
+            .map(|entry| (entry.tex_w, entry.tex_h))
+    }
+
     /// Render from cache using only surf_id — no buf_id required.
     /// Returns true if a cached texture was found and drawn.
     pub fn draw_from_cache(
@@ -283,10 +300,10 @@ impl MetalRenderer {
         };
         let dest_w = viewport_dst
             .map(|d| (d.w as f64 * scale).round() as i32)
-            .unwrap_or(entry.tex_w);
+            .unwrap_or(entry.dest_w);
         let dest_h = viewport_dst
             .map(|d| (d.h as f64 * scale).round() as i32)
-            .unwrap_or(entry.tex_h);
+            .unwrap_or(entry.dest_h);
         if dest_w <= 0 || dest_h <= 0 {
             return false;
         }
@@ -324,6 +341,7 @@ impl MetalRenderer {
         tex_h: i32,
         bytes_per_row: usize,
         pixels: &[u8],
+        damage: &[BufferDamage],
     ) {
         if dest_w <= 0 || dest_h <= 0 {
             return;
@@ -333,8 +351,17 @@ impl MetalRenderer {
             return;
         };
 
-        let texture =
-            self.get_or_create_texture(surface_id, buffer_id, tex_w, tex_h, bytes_per_row, pixels);
+        let texture = self.get_or_create_texture(
+            surface_id,
+            buffer_id,
+            dest_w,
+            dest_h,
+            tex_w,
+            tex_h,
+            bytes_per_row,
+            pixels,
+            damage,
+        );
         let Some(texture) = texture else {
             return;
         };
@@ -397,23 +424,15 @@ impl MetalRenderer {
         &self,
         surface_id: ObjectId,
         buffer_id: ObjectId,
+        dest_w: i32,
+        dest_h: i32,
         tex_w: i32,
         tex_h: i32,
         bytes_per_row: usize,
         pixels: &[u8],
+        damage: &[BufferDamage],
     ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
         let mut cache = self.texture_cache.borrow_mut();
-
-        // Empty pixels = cache-hit path requested by caller.
-        if pixels.is_empty() {
-            return cache.get(&surface_id).and_then(|e| {
-                if e.buffer_id == buffer_id {
-                    Some(e.texture.clone())
-                } else {
-                    None
-                }
-            });
-        }
 
         let row_bytes = (tex_w.max(0) as usize).saturating_mul(4);
         let required = (tex_h.max(0) as usize)
@@ -441,17 +460,36 @@ impl MetalRenderer {
         // Reuse existing texture if same size — avoids VRAM allocation every frame.
         if let Some(entry) = cache.get_mut(&surface_id) {
             if entry.tex_w == tex_w && entry.tex_h == tex_h {
-                unsafe {
-                    entry
-                        .texture
-                        .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
-                            region,
-                            0,
-                            slice_bytes(pixels),
-                            bytes_per_row,
-                        );
+                if let Some(damage) = coalesce_damage(damage, tex_w, tex_h) {
+                    let byte_offset = (damage.y as usize)
+                        .saturating_mul(bytes_per_row)
+                        .saturating_add((damage.x as usize).saturating_mul(4));
+                    let damage_region = MTLRegion {
+                        origin: MTLOrigin {
+                            x: damage.x as usize,
+                            y: damage.y as usize,
+                            z: 0,
+                        },
+                        size: MTLSize {
+                            width: damage.width as usize,
+                            height: damage.height as usize,
+                            depth: 1,
+                        },
+                    };
+                    unsafe {
+                        entry
+                            .texture
+                            .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                                damage_region,
+                                0,
+                                NonNull::new_unchecked(pixels.as_ptr().add(byte_offset) as *mut _),
+                                bytes_per_row,
+                            );
+                    }
                 }
                 entry.buffer_id = buffer_id;
+                entry.dest_w = dest_w;
+                entry.dest_h = dest_h;
                 return Some(entry.texture.clone());
             }
         }
@@ -482,9 +520,73 @@ impl MetalRenderer {
                 buffer_id,
                 tex_w,
                 tex_h,
+                dest_w,
+                dest_h,
             },
         );
         Some(cloned)
+    }
+}
+
+fn coalesce_damage(damage: &[BufferDamage], width: i32, height: i32) -> Option<BufferDamage> {
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    for rect in damage {
+        let x1 = rect.x.clamp(0, width);
+        let y1 = rect.y.clamp(0, height);
+        let x2 = rect.x.saturating_add(rect.width).clamp(0, width);
+        let y2 = rect.y.saturating_add(rect.height).clamp(0, height);
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        bounds = Some(match bounds {
+            Some((left, top, right, bottom)) => {
+                (left.min(x1), top.min(y1), right.max(x2), bottom.max(y2))
+            }
+            None => (x1, y1, x2, y2),
+        });
+    }
+    bounds.map(|(x1, y1, x2, y2)| BufferDamage {
+        x: x1,
+        y: y1,
+        width: x2 - x1,
+        height: y2 - y1,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BufferDamage, coalesce_damage};
+
+    #[test]
+    fn damage_is_clipped_and_coalesced() {
+        let damage = [
+            BufferDamage {
+                x: -5,
+                y: 10,
+                width: 20,
+                height: 15,
+            },
+            BufferDamage {
+                x: 80,
+                y: 70,
+                width: 40,
+                height: 40,
+            },
+        ];
+        assert_eq!(
+            coalesce_damage(&damage, 100, 90),
+            Some(BufferDamage {
+                x: 0,
+                y: 10,
+                width: 100,
+                height: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn empty_damage_skips_texture_upload() {
+        assert_eq!(coalesce_damage(&[], 100, 90), None);
     }
 }
 

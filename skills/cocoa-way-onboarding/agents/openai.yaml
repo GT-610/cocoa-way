@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cocoa-Way Onboarding"
+  short_description: "Prepare safe Cocoa-Way image, app, and connection settings"
+  default_prompt: "Use $cocoa-way-onboarding to prepare a reviewable Cocoa-Way setup for this application or machine."

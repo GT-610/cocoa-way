@@ -2,6 +2,21 @@ pub enum CompositorMessage {
     GuestClipboardText(String),
     Maximize(bool),
     Fullscreen(bool),
+    RootlessToplevelCreated(smithay::reexports::wayland_server::backend::ObjectId),
+    RootlessSurfaceDestroyed(smithay::reexports::wayland_server::backend::ObjectId),
+    RootlessToplevelDestroyed(smithay::reexports::wayland_server::backend::ObjectId),
+    RootlessToplevelTitleChanged(smithay::reexports::wayland_server::backend::ObjectId),
+    RootlessMaximize {
+        surface: smithay::reexports::wayland_server::backend::ObjectId,
+        maximized: bool,
+    },
+    RootlessFullscreen {
+        surface: smithay::reexports::wayland_server::backend::ObjectId,
+        fullscreen: bool,
+    },
+    RootlessMinimize(smithay::reexports::wayland_server::backend::ObjectId),
+    RootlessBeginMove(smithay::reexports::wayland_server::backend::ObjectId),
+    ShowDefaultDisplay,
     ToggleHiDpi,
     Connect(usize),
     ConnectMachine(crate::connections::Connection),
@@ -10,6 +25,24 @@ pub enum CompositorMessage {
     CheckContainerSession(usize),
     StartContainerSession(usize),
     StopContainerSession(usize),
+    ForceStopContainerSession(usize),
+    ContainerSessionChecked {
+        index: usize,
+        launch_after: bool,
+        result:
+            Result<crate::container_sessions::CheckReport, crate::container_sessions::LaunchError>,
+    },
+    ContainerSessionLaunchProgress {
+        index: usize,
+        step: crate::application_model::LaunchStep,
+        detail: String,
+    },
+    ContainerSessionLaunchFinished {
+        index: usize,
+        display_slot: String,
+        result:
+            Result<crate::container_sessions::LaunchReport, crate::container_sessions::LaunchError>,
+    },
     DedicatedDisplayStarted {
         index: usize,
         display_slot: String,
@@ -96,6 +129,15 @@ pub enum CompositorMessage {
         runtime: String,
         name: String,
     },
+    RuntimeMachineAction {
+        runtime: String,
+        name: String,
+        action: String,
+    },
+    OpenRuntimeMachineTerminal {
+        runtime: String,
+        name: String,
+    },
     RefreshRuntimeContainerDetails {
         runtime: String,
         name: String,
@@ -108,6 +150,8 @@ pub enum CompositorMessage {
         stats: Vec<String>,
         error: Option<String>,
     },
+    ContainerModeCommandCacheUpdated,
+    ContainerModeCommandCacheRefreshDue,
     RuntimeSystemAction {
         runtime: String,
         action: String,

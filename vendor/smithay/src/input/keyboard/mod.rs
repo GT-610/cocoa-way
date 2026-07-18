@@ -5,6 +5,11 @@ mod stub;
 #[cfg(not(feature = "xkbcommon"))]
 pub use stub::*;
 
+#[cfg(all(feature = "xkbcommon", feature = "wayland_frontend"))]
+mod keymap_file;
+#[cfg(all(feature = "xkbcommon", feature = "wayland_frontend"))]
+pub use keymap_file::{KeymapFile, KeymapFileId};
+
 #[cfg(feature = "xkbcommon")]
 mod implementation {
 
@@ -28,11 +33,9 @@ mod implementation {
     use super::super::{GrabStatus, Seat, SeatHandler};
 
     #[cfg(feature = "wayland_frontend")]
+    use super::{KeymapFile, KeymapFileId};
+    #[cfg(feature = "wayland_frontend")]
     use wayland_server::{Resource, Weak};
-    #[cfg(feature = "wayland_frontend")]
-    mod keymap_file;
-    #[cfg(feature = "wayland_frontend")]
-    pub use keymap_file::{KeymapFile, KeymapFileId};
 
     mod modifiers_state;
     pub use modifiers_state::{ModifiersState, SerializedMods};

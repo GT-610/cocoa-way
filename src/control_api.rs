@@ -117,9 +117,25 @@ fn dispatch(
     let command = request.command.trim().to_ascii_lowercase();
     match command.as_str() {
         "status" => ControlResponse::success(&command, status_snapshot(path)),
-        "sessions" => ControlResponse::success(&command, sessions_snapshot()),
+        "applications" | "sessions" => ControlResponse::success(&command, sessions_snapshot()),
+        "running" => ControlResponse::success(&command, active_sessions_json()),
         "displays" => ControlResponse::success(&command, displays_snapshot()),
         "images" => ControlResponse::success(&command, images_snapshot()),
+        "volumes" => ControlResponse::success(&command, volumes_snapshot()),
+        "runtimes" => ControlResponse::success(&command, runtimes_snapshot()),
+        "tasks" => ControlResponse::success(
+            &command,
+            serde_json::to_value(container_mode::control_operation_tasks(
+                request.limit.clamp(1, 1000),
+            ))
+            .unwrap_or_else(|error| json!({ "error": error.to_string() })),
+        ),
+        "environment" => ControlResponse::success(&command, environment_snapshot(path)),
+        "features" => ControlResponse::success(&command, feature_matrix_snapshot()),
+        "diagnostics" => ControlResponse::success(
+            &command,
+            diagnostics_snapshot(path, request.session.as_deref(), request.limit),
+        ),
         "logs" => match resolve_session(request.session.as_deref()) {
             Ok((index, session)) => ControlResponse::success(
                 &command,
@@ -136,7 +152,7 @@ fn dispatch(
         }
         _ => ControlResponse::failure(
             &command,
-            "unsupported command; use status, sessions, displays, images, logs, check, launch, or stop",
+            "unsupported command; use status, applications, running, displays, images, volumes, runtimes, tasks, environment, features, diagnostics, logs, check, launch, or stop",
         ),
     }
 }
@@ -227,7 +243,9 @@ fn status_snapshot(path: &Path) -> Value {
         "performance": performance,
         "resources": diagnostics::resource_snapshot(),
         "clipboard": diagnostics::clipboard_snapshot(),
+        "audio": crate::audio::snapshot(),
         "activity": container_mode::control_activity_snapshot(10),
+        "tasks": container_mode::control_operation_tasks(20),
     })
 }
 
@@ -238,7 +256,7 @@ fn sessions_snapshot() -> Value {
             .into_iter()
             .enumerate()
             .map(|(index, session)| {
-                let tracked = active.iter().find(|active| active.0 == index);
+                let tracked = active.iter().find(|active| active.1 == index);
                 let state = container_mode::control_session_state(index);
                 json!({
                     "index": index,
@@ -248,13 +266,16 @@ fn sessions_snapshot() -> Value {
                     "command": session.command,
                     "profile": session.profile,
                     "display": session.display.as_deref().unwrap_or("auto"),
+                    "audio": session.audio,
                     "state": state.as_ref().map(|state| state.0.as_str()).unwrap_or(if tracked.is_some() { "Running" } else { "Idle" }),
                     "state_detail": state.map(|state| state.1),
                     "active": tracked.map(|active| json!({
-                        "container_pid": active.1,
-                        "waypipe_pid": active.2,
-                        "display_slot": active.3,
-                        "display_pid": active.4,
+                        "instance_id": active.0,
+                        "started_at_unix_ms": active.2,
+                        "container_pid": active.3,
+                        "waypipe_pid": active.4,
+                        "display_slot": active.5,
+                        "display_pid": active.6,
                     })),
                 })
             })
@@ -269,6 +290,29 @@ fn displays_snapshot() -> Value {
             "description": "The compositor window owned by the main Cocoa-Way process."
         },
         "active": active_sessions_json(),
+        "performance": container_mode::control_display_performance()
+            .into_iter()
+            .map(|(slot, redraw_fps, commits_per_second, late_redraws_per_second, max_redraw_wait_ms, input_to_present_ms, sampled_at_unix_ms)| json!({
+                "slot": slot,
+                "redraw_fps": redraw_fps,
+                "commits_per_second": commits_per_second,
+                "late_redraws_per_second": late_redraws_per_second,
+                "max_redraw_wait_ms": max_redraw_wait_ms,
+                "host_input_to_present_ms": input_to_present_ms,
+                "sampled_at_unix_ms": sampled_at_unix_ms,
+            }))
+            .collect::<Vec<_>>(),
+        "managed": container_mode::control_managed_displays()
+            .into_iter()
+            .map(|(slot, status, runtime_dir, display, pid, attachments)| json!({
+                "slot": slot,
+                "status": status,
+                "runtime_dir": runtime_dir,
+                "wayland_display": display,
+                "pid": pid,
+                "attachments": attachments,
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -277,9 +321,19 @@ fn active_sessions_json() -> Value {
         container_mode::control_active_sessions()
             .into_iter()
             .map(
-                |(index, container_pid, waypipe_pid, display_slot, display_pid)| {
+                |(
+                    instance_id,
+                    profile_index,
+                    started_at_unix_ms,
+                    container_pid,
+                    waypipe_pid,
+                    display_slot,
+                    display_pid,
+                )| {
                     json!({
-                        "index": index,
+                        "instance_id": instance_id,
+                        "profile_index": profile_index,
+                        "started_at_unix_ms": started_at_unix_ms,
                         "container_pid": container_pid,
                         "waypipe_pid": waypipe_pid,
                         "display_slot": display_slot,
@@ -305,6 +359,175 @@ fn images_snapshot() -> Value {
             &child_path,
         ),
     })
+}
+
+fn volumes_snapshot() -> Value {
+    let child_path = build_child_path();
+    json!({
+        "apple_container": command_snapshot(
+            "container",
+            &["volume", "list", "--format", "json"],
+            &child_path,
+        ),
+        "docker_compatible": command_snapshot(
+            "docker",
+            &["volume", "ls", "--format", "{{json .}}"],
+            &child_path,
+        ),
+    })
+}
+
+fn runtimes_snapshot() -> Value {
+    let child_path = build_child_path();
+    json!({
+        "operations": container_mode::control_runtime_states()
+            .into_iter()
+            .map(|(runtime, status, detail)| json!({
+                "runtime": runtime,
+                "status": status,
+                "detail": detail,
+            }))
+            .collect::<Vec<_>>(),
+        "apple_container": {
+            "cli": command_probe("container", &["--version"], &child_path),
+            "system": command_probe("container", &["system", "status"], &child_path),
+        },
+        "docker_compatible": {
+            "cli": command_probe("docker", &["--version"], &child_path),
+            "connection": command_probe("docker", &["info", "--format", "{{.ServerVersion}}"], &child_path),
+            "contexts": command_snapshot("docker", &["context", "ls", "--format", "{{json .}}"], &child_path),
+        },
+        "orbstack_provider": {
+            "cli": command_probe("orbctl", &["version"], &child_path),
+            "status": command_probe("orbctl", &["status"], &child_path),
+            "machines": command_snapshot("orbctl", &["list", "--format", "json"], &child_path),
+        },
+    })
+}
+
+fn environment_snapshot(path: &Path) -> Value {
+    let child_path = build_child_path();
+    redact_value(json!({
+        "cocoa_way": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "pid": std::process::id(),
+            "control_socket": path,
+            "config_path": container_sessions::config_path(),
+            "config_exists": container_sessions::config_path().is_file(),
+        },
+        "host": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "macos_version": command_snapshot("sw_vers", &["-productVersion"], &child_path),
+        },
+        "commands": {
+            "apple_container": command_probe("container", &["--version"], &child_path),
+            "apple_container_system": command_probe("container", &["system", "status"], &child_path),
+            "waypipe": command_probe("waypipe", &["--version"], &child_path),
+            "docker": command_probe("docker", &["--version"], &child_path),
+            "orbstack": command_probe("orbctl", &["version"], &child_path),
+            "orbstack_status": command_probe("orbctl", &["status"], &child_path),
+        },
+    }))
+}
+
+fn feature_matrix_snapshot() -> Value {
+    json!({
+        "presentation": {
+            "desktop": { "status": "supported", "note": "One compositor desktop per display slot." },
+            "rootless": { "status": "experimental", "note": "Native macOS windows for regular xdg-shell applications; nested compositors are rejected." },
+            "dedicated_displays": { "status": "supported", "note": "Automatic and manually named display slots are available." },
+        },
+        "transport": {
+            "apple_container_socket_v2": { "status": "supported", "fallback": "stdio relay" },
+            "classic_waypipe": { "status": "supported", "targets": ["SSH", "Docker", "OrbStack"] },
+            "clipboard_text": { "status": "supported", "scope": "text MIME types" },
+            "audio": { "status": "supported_default_on", "format": "s16le/48000/2", "note": "Apple Container playback uses an independent published socket and macOS CoreAudio. Profiles can explicitly disable it; Metal rendering is unchanged." },
+        },
+        "runtime_control": {
+            "apple_container": ["system", "containers", "images", "volumes"],
+            "docker": ["contexts", "containers", "images"],
+            "orbstack": ["system", "machines", "docker_compatible_containers"],
+        },
+        "automation": {
+            "control_socket": "local Unix socket",
+            "cli": "cocoa-wayctl",
+            "mcp": { "status": "read_only", "destructive_tools": false },
+        },
+        "known_limits": [
+            "Rootless Xwayland application projection is not available.",
+            "Nested compositors such as niri and Hyprland require desktop presentation.",
+            "Audio requires an image containing cocoa-way-audio-relay."
+        ],
+    })
+}
+
+fn diagnostics_snapshot(path: &Path, selector: Option<&str>, limit: usize) -> Value {
+    let selected_logs = selector.map(|selector| match resolve_session(Some(selector)) {
+        Ok((index, session)) => json!({
+            "index": index,
+            "name": session.name,
+            "lines": container_mode::control_session_logs(index, limit.clamp(1, 1000)),
+        }),
+        Err(error) => json!({ "selector": selector, "error": error }),
+    });
+    redact_value(json!({
+        "generated_at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis()),
+        "status": status_snapshot(path),
+        "environment": environment_snapshot(path),
+        "features": feature_matrix_snapshot(),
+        "sessions": sessions_snapshot(),
+        "displays": displays_snapshot(),
+        "images": images_snapshot(),
+        "volumes": volumes_snapshot(),
+        "runtimes": runtimes_snapshot(),
+        "selected_session_logs": selected_logs,
+        "privacy": "Home-directory paths and the local account name are redacted before this snapshot is returned.",
+    }))
+}
+
+fn command_probe(command: &str, args: &[&str], child_path: &str) -> Value {
+    let Some(path) = find_command_path(command, child_path) else {
+        return json!({ "available": false, "error": format!("{command} command not found") });
+    };
+    json!({
+        "available": true,
+        "path": path,
+        "result": command_snapshot(command, args, child_path),
+    })
+}
+
+fn redact_value(mut value: Value) -> Value {
+    let home = std::env::var("HOME").ok().filter(|value| !value.is_empty());
+    let user = std::env::var("USER").ok().filter(|value| !value.is_empty());
+    redact_value_in_place(&mut value, home.as_deref(), user.as_deref());
+    value
+}
+
+fn redact_value_in_place(value: &mut Value, home: Option<&str>, user: Option<&str>) {
+    match value {
+        Value::String(text) => {
+            if let Some(home) = home {
+                *text = text.replace(home, "~");
+            }
+            if let Some(user) = user {
+                *text = text.replace(user, "<user>");
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_value_in_place(value, home, user);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_value_in_place(value, home, user);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn command_snapshot(command: &str, args: &[&str], child_path: &str) -> Value {
@@ -379,6 +602,57 @@ mod tests {
         );
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("unsupported command"));
+    }
+
+    #[test]
+    fn application_control_queries_are_structured_and_read_only() {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        for command in ["applications", "sessions", "running", "displays", "tasks"] {
+            let response = dispatch(
+                ControlRequest {
+                    command: command.into(),
+                    session: None,
+                    limit: 10,
+                },
+                &sender,
+                Path::new("/tmp/control.sock"),
+            );
+            assert!(response.ok, "{command} failed: {:?}", response.error);
+            assert!(!response.data.is_null(), "{command} returned no data");
+        }
+    }
+
+    #[test]
+    fn feature_matrix_keeps_automation_read_only() {
+        let features = feature_matrix_snapshot();
+        assert_eq!(features["automation"]["mcp"]["status"], "read_only");
+        assert_eq!(features["automation"]["mcp"]["destructive_tools"], false);
+    }
+
+    #[test]
+    fn feature_matrix_reports_audio_as_enabled_by_default() {
+        let features = feature_matrix_snapshot();
+        assert_eq!(
+            features["transport"]["audio"]["status"],
+            "supported_default_on"
+        );
+        assert!(
+            !features["known_limits"][2]
+                .as_str()
+                .unwrap()
+                .contains("enabled per session")
+        );
+    }
+
+    #[test]
+    fn diagnostics_redaction_covers_nested_values() {
+        let mut value = json!({
+            "path": "/Users/alice/.config/cocoa-way",
+            "nested": ["owner=alice"]
+        });
+        redact_value_in_place(&mut value, Some("/Users/alice"), Some("alice"));
+        assert_eq!(value["path"], "~/.config/cocoa-way");
+        assert_eq!(value["nested"][0], "owner=<user>");
     }
 
     #[test]

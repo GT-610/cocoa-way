@@ -1,20 +1,28 @@
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use objc2::declare_class;
 use objc2::mutability::MainThreadOnly;
-use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject};
+use objc2::rc::{Allocated, Retained};
+use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::{ClassType, DeclaredClass, msg_send, msg_send_id, sel};
 use objc2_app_kit::{
-    NSAlert, NSBackingStoreType, NSBox, NSBoxType, NSButton, NSColor, NSFont, NSModalResponseOK,
-    NSOpenPanel, NSPasteboard, NSPasteboardTypeString, NSPopUpButton, NSScrollView,
-    NSSecureTextField, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAlert, NSApplicationActivationOptions, NSBackingStoreType, NSBox, NSBoxType, NSButton,
+    NSColor, NSFont, NSModalResponseOK, NSOpenPanel, NSPasteboard, NSPasteboardTypeString,
+    NSPopUpButton, NSRunningApplication, NSSavePanel, NSScrollView, NSSecureTextField, NSTextField,
+    NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use serde::{Deserialize, Serialize};
 
+use crate::application_model::{
+    ApplicationInstanceSnapshot, DisplayStatus, InstanceStatus, LaunchStep, OperationTask,
+    ProfileStatus, RuntimeStatus, TaskStatus, TaskStep, TaskStepStatus,
+};
 use crate::container_sessions::{self, ContainerSession};
 use crate::messages::CompositorMessage;
 use crate::runtime_paths::{build_child_path, find_command_path, shell_single_quote};
@@ -28,6 +36,8 @@ static SELECTED_SESSION: Mutex<Option<usize>> = Mutex::new(None);
 static ACTIVITY: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SESSION_STATES: Mutex<Vec<(usize, SessionState)>> = Mutex::new(Vec::new());
 static SESSION_LOGS: Mutex<Vec<(usize, Vec<String>)>> = Mutex::new(Vec::new());
+static OPERATION_TASKS: Mutex<Vec<OperationTask>> = Mutex::new(Vec::new());
+static AUTO_VALIDATION_REQUESTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 static IMAGE_TASK_ACTIVE: Mutex<Option<String>> = Mutex::new(None);
 static IMAGE_TASK_DETAIL: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_PULL_SESSION: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -35,9 +45,9 @@ static LAST_STREAM_REBUILD: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_PERFORMANCE_REBUILD: Mutex<Option<Instant>> = Mutex::new(None);
 static LAST_RESIZE_REBUILD: Mutex<Option<Instant>> = Mutex::new(None);
 static IMAGE_CREATE_ACTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-static IMAGE_DELETE_ACTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static IMAGE_DELETE_ACTIONS: Mutex<Vec<ImageDeleteAction>> = Mutex::new(Vec::new());
 static IMAGE_SELECT_ACTIONS: Mutex<Vec<SelectedImage>> = Mutex::new(Vec::new());
-static VOLUME_DELETE_ACTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static VOLUME_DELETE_ACTIONS: Mutex<Vec<VolumeDeleteAction>> = Mutex::new(Vec::new());
 static VOLUME_SELECT_ACTIONS: Mutex<Vec<SelectedVolume>> = Mutex::new(Vec::new());
 static SELECTED_IMAGE: Mutex<Option<SelectedImage>> = Mutex::new(None);
 static SELECTED_VOLUME: Mutex<Option<SelectedVolume>> = Mutex::new(None);
@@ -46,16 +56,33 @@ static RUNTIME_CONTAINER_SELECT_ACTIONS: Mutex<Vec<SelectedRuntimeContainer>> =
     Mutex::new(Vec::new());
 static SELECTED_RUNTIME_CONTAINER: Mutex<Option<SelectedRuntimeContainer>> = Mutex::new(None);
 static RUNTIME_CONTAINER_DETAILS: Mutex<Option<RuntimeContainerDetails>> = Mutex::new(None);
+static RUNTIME_SYSTEM_STATES: Mutex<Vec<RuntimeSystemState>> = Mutex::new(Vec::new());
 static DOCKER_CONTEXT_ACTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static ORBSTACK_MACHINE_ACTIONS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static PERFORMANCE: Mutex<Option<PerformanceSnapshot>> = Mutex::new(None);
 static ACTIVE_SESSIONS: Mutex<Vec<ActiveSessionSnapshot>> = Mutex::new(Vec::new());
 static MANAGED_DISPLAYS: Mutex<Vec<ManagedDisplaySnapshot>> = Mutex::new(Vec::new());
 static PENDING_MANAGED_DISPLAYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CLOSING_MANAGED_DISPLAYS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static MANAGED_DISPLAY_LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static MANAGED_DISPLAY_ACTIONS: Mutex<Vec<ManagedDisplaySnapshot>> = Mutex::new(Vec::new());
-static RUNTIME_FPS_LABEL: Mutex<Option<usize>> = Mutex::new(None);
 static APPLE_COMPATIBILITY_CACHE: Mutex<Option<(Instant, AppleContainerCompatibility)>> =
     Mutex::new(None);
+static UI_COMMAND_CACHE: LazyLock<Mutex<HashMap<String, UiCommandCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static UI_COMMAND_REFRESHING: LazyLock<Mutex<HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static SCROLL_POSITIONS: LazyLock<Mutex<HashMap<String, f64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static LIST_SCROLL_VIEW: Mutex<Option<TrackedScrollView>> = Mutex::new(None);
+static DETAIL_SCROLL_VIEW: Mutex<Option<TrackedScrollView>> = Mutex::new(None);
+static SUMMARY_FPS_LABEL: Mutex<Option<usize>> = Mutex::new(None);
+static LIVE_DISPLAY_FPS_LABELS: Mutex<Vec<LiveDisplayFpsLabel>> = Mutex::new(Vec::new());
+static COMMAND_CACHE_REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+const UI_COMMAND_CACHE_TTL: Duration = Duration::from_secs(10);
+const UI_COMMAND_LOADING: &str = "Loading runtime data...";
 
 const NAV_SESSIONS: usize = 0;
 const NAV_IMAGES: usize = 1;
@@ -66,20 +93,21 @@ const NAV_DOCKER: usize = 5;
 const NAV_ORBSTACK: usize = 6;
 const NAV_ACTIVITY: usize = 7;
 const NAV_COMMANDS: usize = 8;
+const NAV_RUNNING: usize = 9;
 
 #[derive(Clone)]
 struct SessionState {
-    label: &'static str,
+    profile: ProfileStatus,
+    instance: Option<InstanceStatus>,
     detail: String,
+    failed_step: Option<LaunchStep>,
+    force_stop_available: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct ActiveSessionSnapshot {
-    index: usize,
-    container_pid: Option<u32>,
-    waypipe_pid: u32,
-    display_slot: String,
-    display_pid: Option<u32>,
+    instance: ApplicationInstanceSnapshot,
+    display_runtime_dir: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -88,6 +116,12 @@ struct ManagedDisplaySnapshot {
     runtime_dir: String,
     display: String,
     pid: u32,
+}
+
+struct LiveDisplayFpsLabel {
+    slot: String,
+    base: String,
+    pointer: usize,
 }
 
 #[derive(Clone)]
@@ -99,11 +133,44 @@ struct SelectedImage {
 }
 
 #[derive(Clone)]
+struct ImageDeleteAction {
+    runtime: String,
+    reference: String,
+    image_id: Option<String>,
+}
+
+#[derive(Clone)]
 struct SelectedVolume {
     runtime: String,
     runtime_key: String,
     name: String,
     label: String,
+}
+
+#[derive(Clone)]
+struct VolumeDeleteAction {
+    runtime: String,
+    name: String,
+}
+
+#[derive(Default)]
+struct VolumeUsage {
+    referenced_profiles: Vec<String>,
+    mounted_containers: Vec<String>,
+    loading: bool,
+    error: Option<String>,
+}
+
+struct VolumeMetadata {
+    kind: String,
+    size: String,
+    created: String,
+}
+
+#[derive(Clone)]
+struct TrackedScrollView {
+    pointer: usize,
+    key: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -125,6 +192,13 @@ struct RuntimeContainerDetails {
 }
 
 #[derive(Clone)]
+struct RuntimeSystemState {
+    runtime: String,
+    status: RuntimeStatus,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PerformanceSnapshot {
     redraw_fps: f64,
     commits_per_second: f64,
@@ -134,6 +208,7 @@ struct PerformanceSnapshot {
     late_redraws_per_second: f64,
     max_redraw_wait_ms: f64,
     input_to_present_ms: Option<f64>,
+    sampled_at_unix_ms: u128,
 }
 
 #[derive(Clone)]
@@ -147,16 +222,40 @@ struct AppleContainerCompatibility {
     detail: String,
 }
 
-#[derive(Default)]
+#[derive(Clone)]
+struct UiCommandCacheEntry {
+    completed_at: Instant,
+    result: Result<Arc<Output>, String>,
+}
+
 struct AddSessionDefaults {
     name: String,
     runtime: String,
     display: String,
+    presentation: String,
     profile: String,
     image: String,
     command: String,
     mounts: String,
     env: String,
+    audio: bool,
+}
+
+impl Default for AddSessionDefaults {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            runtime: String::new(),
+            display: String::new(),
+            presentation: String::new(),
+            profile: String::new(),
+            image: String::new(),
+            command: String::new(),
+            mounts: String::new(),
+            env: String::new(),
+            audio: true,
+        }
+    }
 }
 
 fn send(msg: CompositorMessage) {
@@ -167,11 +266,48 @@ fn send(msg: CompositorMessage) {
     }
 }
 
+fn schedule_automatic_profile_validation(sessions: &[ContainerSession]) {
+    for (index, _) in sessions.iter().enumerate() {
+        if session_state(index).is_some() {
+            continue;
+        }
+        let should_validate = {
+            let mut requested = AUTO_VALIDATION_REQUESTED.lock().unwrap();
+            if requested.contains(&index) {
+                false
+            } else {
+                requested.push(index);
+                true
+            }
+        };
+        if should_validate {
+            send(CompositorMessage::CheckContainerSession(index));
+        }
+    }
+}
+
+fn invalidate_profile_validation(index: usize) {
+    SESSION_STATES
+        .lock()
+        .unwrap()
+        .retain(|(stored, _)| *stored != index);
+    AUTO_VALIDATION_REQUESTED
+        .lock()
+        .unwrap()
+        .retain(|stored| *stored != index);
+}
+
+fn invalidate_all_profile_validation() {
+    SESSION_STATES.lock().unwrap().clear();
+    AUTO_VALIDATION_REQUESTED.lock().unwrap().clear();
+}
+
 fn remember_launch_request(index: usize) {
     let sessions = container_sessions::load_sessions();
     let message = match sessions.get(index) {
         Some(session) => {
             clear_session_logs(index);
+            start_launch_task(index, &session.name);
             set_session_state(
                 index,
                 "Starting",
@@ -189,7 +325,10 @@ fn remember_launch_request(index: usize) {
                 session_display_command(session)
             )
         }
-        None => format!("Launch requested for missing session #{}", index + 1),
+        None => format!(
+            "Launch requested for missing application profile #{}",
+            index + 1
+        ),
     };
     push_activity(message);
 }
@@ -204,6 +343,278 @@ fn push_activity(message: String) {
     if activity.len() > 50 {
         let overflow = activity.len() - 50;
         activity.drain(0..overflow);
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn start_operation_task(
+    key: impl Into<String>,
+    operation: impl Into<String>,
+    subject: impl Into<String>,
+    steps: impl IntoIterator<Item = impl Into<String>>,
+) -> u64 {
+    let key = key.into();
+    let now = now_unix_ms();
+    let id = TASK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let task = OperationTask {
+        id,
+        key: key.clone(),
+        operation: operation.into(),
+        subject: subject.into(),
+        status: TaskStatus::Queued,
+        steps: steps
+            .into_iter()
+            .map(|name| TaskStep {
+                name: name.into(),
+                status: TaskStepStatus::Pending,
+                detail: None,
+            })
+            .collect(),
+        detail: None,
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now,
+    };
+    let mut tasks = OPERATION_TASKS.lock().unwrap();
+    tasks.retain(|existing| existing.key != key || !existing.status.is_active());
+    tasks.push(task);
+    if tasks.len() > 100 {
+        let overflow = tasks.len() - 100;
+        tasks.drain(0..overflow);
+    }
+    id
+}
+
+fn update_operation_task_step(
+    key: &str,
+    step: &str,
+    status: TaskStepStatus,
+    detail: Option<String>,
+) {
+    let mut tasks = OPERATION_TASKS.lock().unwrap();
+    let Some(task) = tasks.iter_mut().rev().find(|task| task.key == key) else {
+        return;
+    };
+    task.status = if status == TaskStepStatus::Failed {
+        TaskStatus::Failed
+    } else {
+        TaskStatus::Running
+    };
+    if let Some(target_index) = task.steps.iter().position(|target| target.name == step) {
+        if status == TaskStepStatus::Running {
+            for previous in &mut task.steps[..target_index] {
+                if matches!(
+                    previous.status,
+                    TaskStepStatus::Pending | TaskStepStatus::Running
+                ) {
+                    previous.status = TaskStepStatus::Completed;
+                }
+            }
+        }
+        let target = &mut task.steps[target_index];
+        target.status = status;
+        target.detail = detail.clone();
+    }
+    task.detail = detail;
+    task.updated_at_unix_ms = now_unix_ms();
+}
+
+fn finish_operation_task(key: &str, status: TaskStatus, detail: impl Into<String>) {
+    let detail = detail.into();
+    let mut tasks = OPERATION_TASKS.lock().unwrap();
+    let Some(task) = tasks.iter_mut().rev().find(|task| task.key == key) else {
+        return;
+    };
+    task.status = status;
+    task.detail = Some(detail);
+    task.updated_at_unix_ms = now_unix_ms();
+    if status == TaskStatus::Completed {
+        for step in &mut task.steps {
+            if step.status != TaskStepStatus::Failed {
+                step.status = TaskStepStatus::Completed;
+            }
+        }
+    } else if status == TaskStatus::Failed {
+        if let Some(step) = task
+            .steps
+            .iter_mut()
+            .find(|step| step.status == TaskStepStatus::Running)
+        {
+            step.status = TaskStepStatus::Failed;
+        }
+    }
+}
+
+fn operation_tasks_snapshot() -> Vec<OperationTask> {
+    OPERATION_TASKS.lock().unwrap().clone()
+}
+
+fn latest_operation_task(key: &str) -> Option<OperationTask> {
+    OPERATION_TASKS
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|task| task.key == key)
+        .cloned()
+}
+
+pub(crate) fn control_operation_tasks(limit: usize) -> Vec<OperationTask> {
+    let tasks = OPERATION_TASKS.lock().unwrap();
+    let start = tasks.len().saturating_sub(limit);
+    tasks[start..].to_vec()
+}
+
+fn active_task_count() -> usize {
+    OPERATION_TASKS
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|task| task.status.is_active())
+        .count()
+}
+
+fn launch_task_key(index: usize) -> String {
+    format!("launch-profile-{index}")
+}
+
+fn stop_task_key(index: usize) -> String {
+    format!("stop-profile-{index}")
+}
+
+fn runtime_task_key(runtime: &str) -> String {
+    format!("runtime-{}", normalized_runtime_key(runtime))
+}
+
+fn resource_task_key(kind: &str, action: &str, runtime: &str, name: &str) -> String {
+    format!(
+        "{}-{}-{}-{}",
+        kind,
+        action,
+        normalized_runtime_key(runtime),
+        name
+    )
+}
+
+fn normalized_runtime_key(runtime: &str) -> String {
+    match runtime.trim().to_ascii_lowercase().as_str() {
+        "apple" | "container" | "apple-container" | "apple container" => "apple".into(),
+        "orb" | "orbstack" => "orbstack".into(),
+        _ => "docker".into(),
+    }
+}
+
+fn set_runtime_system_state(runtime: &str, status: RuntimeStatus, detail: impl Into<String>) {
+    let runtime = normalized_runtime_key(runtime);
+    let detail = detail.into();
+    let mut states = RUNTIME_SYSTEM_STATES.lock().unwrap();
+    if let Some(state) = states.iter_mut().find(|state| state.runtime == runtime) {
+        state.status = status;
+        state.detail = detail;
+    } else {
+        states.push(RuntimeSystemState {
+            runtime,
+            status,
+            detail,
+        });
+    }
+}
+
+fn runtime_system_state(runtime: &str) -> Option<RuntimeSystemState> {
+    let runtime = normalized_runtime_key(runtime);
+    RUNTIME_SYSTEM_STATES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|state| state.runtime == runtime)
+        .cloned()
+}
+
+fn start_launch_task(index: usize, name: &str) {
+    start_operation_task(
+        launch_task_key(index),
+        "Launch application",
+        name,
+        LaunchStep::ALL.map(LaunchStep::label),
+    );
+}
+
+pub fn record_launch_progress(index: usize, step: LaunchStep, detail: &str) {
+    let key = launch_task_key(index);
+    update_operation_task_step(
+        &key,
+        step.label(),
+        TaskStepStatus::Running,
+        Some(detail.into()),
+    );
+    let sessions = container_sessions::load_sessions();
+    let name = sessions
+        .get(index)
+        .map(|profile| profile.name.as_str())
+        .unwrap_or("Application");
+    if let Some((_, state)) = SESSION_STATES
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(stored, _)| *stored == index)
+    {
+        state.profile = ProfileStatus::Ready;
+        state.instance = Some(InstanceStatus::Starting);
+        state.detail = detail.into();
+        state.failed_step = None;
+        state.force_stop_available = false;
+    }
+    push_activity(format!("{}: {}", name, detail));
+    unsafe {
+        refresh_window_without_focus_throttled(Duration::from_millis(100));
+    }
+}
+
+pub fn record_launch_cancelled(index: usize, detail: &str) {
+    let key = launch_task_key(index);
+    finish_operation_task(&key, TaskStatus::Cancelled, detail.to_string());
+    set_session_state(index, "Stopped", detail.into());
+    push_activity(detail.into());
+    unsafe {
+        rebuild_window();
+    }
+}
+
+pub fn record_force_stop_available(index: usize) {
+    if let Some((_, state)) = SESSION_STATES
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(stored, _)| *stored == index)
+    {
+        state.force_stop_available = true;
+        state.detail =
+            "The application did not exit before the timeout. Force Stop is now available.".into();
+    }
+    push_activity(format!(
+        "Application #{} did not exit gracefully; Force Stop is available",
+        index + 1
+    ));
+    unsafe {
+        rebuild_window();
+    }
+}
+
+pub fn record_stop_progress(index: usize, step: &str, detail: &str) {
+    update_operation_task_step(
+        &stop_task_key(index),
+        step,
+        TaskStepStatus::Running,
+        Some(detail.into()),
+    );
+    push_activity(detail.into());
+    unsafe {
+        refresh_window_without_focus_throttled(Duration::from_millis(100));
     }
 }
 
@@ -239,7 +650,7 @@ pub fn record_performance_snapshot(
     max_redraw_wait_ms: f64,
     input_to_present_ms: Option<f64>,
 ) {
-    *PERFORMANCE.lock().unwrap() = Some(PerformanceSnapshot {
+    let snapshot = PerformanceSnapshot {
         redraw_fps,
         commits_per_second,
         tiles,
@@ -248,7 +659,19 @@ pub fn record_performance_snapshot(
         late_redraws_per_second,
         max_redraw_wait_ms,
         input_to_present_ms,
-    });
+        sampled_at_unix_ms: now_unix_ms(),
+    };
+    publish_worker_performance(&snapshot);
+    *PERFORMANCE.lock().unwrap() = Some(snapshot.clone());
+    if let Some(pointer) = *SUMMARY_FPS_LABEL.lock().unwrap() {
+        let summary = summary_performance_snapshot().unwrap_or_else(|| snapshot.clone());
+        unsafe {
+            let label = &*(pointer as *const NSTextField);
+            let _: () = msg_send![label, setStringValue:
+                &*NSString::from_str(&display_fps_state(&summary))];
+        }
+    }
+    update_live_display_fps_labels();
     let should_refresh = SELECTED_NAV
         .lock()
         .map(|nav| *nav == NAV_ACTIVITY)
@@ -257,15 +680,136 @@ pub fn record_performance_snapshot(
         unsafe {
             refresh_window_without_focus_throttled(Duration::from_secs(2));
         }
-    } else {
-        unsafe {
-            update_runtime_fps_label();
-        }
     }
 }
 
 fn performance_snapshot() -> Option<PerformanceSnapshot> {
     PERFORMANCE.lock().unwrap().clone()
+}
+
+fn display_fps_state(snapshot: &PerformanceSnapshot) -> String {
+    if snapshot.redraw_fps < 0.05 && snapshot.commits_per_second < 0.05 {
+        "0.0 fps · idle".into()
+    } else {
+        format!("{:.1} fps", snapshot.redraw_fps)
+    }
+}
+
+fn display_fps_text(base: &str, snapshot: Option<&PerformanceSnapshot>) -> String {
+    snapshot
+        .map(|snapshot| format!("{base} · {}", display_fps_state(snapshot)))
+        .unwrap_or_else(|| base.to_string())
+}
+
+fn register_live_display_fps_label(
+    label: &Retained<NSTextField>,
+    slot: impl Into<String>,
+    base: impl Into<String>,
+) {
+    LIVE_DISPLAY_FPS_LABELS
+        .lock()
+        .unwrap()
+        .push(LiveDisplayFpsLabel {
+            slot: slot.into(),
+            base: base.into(),
+            pointer: Retained::as_ptr(label) as usize,
+        });
+}
+
+fn update_live_display_fps_labels() {
+    let snapshots = control_display_performance()
+        .into_iter()
+        .map(
+            |(
+                slot,
+                redraw_fps,
+                commits_per_second,
+                late_redraws_per_second,
+                max_redraw_wait_ms,
+                input_to_present_ms,
+                sampled_at_unix_ms,
+            )| {
+                (
+                    slot,
+                    PerformanceSnapshot {
+                        redraw_fps,
+                        commits_per_second,
+                        tiles: 0,
+                        dirty: false,
+                        pending_frame_callbacks: 0,
+                        late_redraws_per_second,
+                        max_redraw_wait_ms,
+                        input_to_present_ms,
+                        sampled_at_unix_ms,
+                    },
+                )
+            },
+        )
+        .collect::<HashMap<_, _>>();
+    for live in LIVE_DISPLAY_FPS_LABELS.lock().unwrap().iter() {
+        let text = display_fps_text(&live.base, snapshots.get(&live.slot));
+        unsafe {
+            let label = &*(live.pointer as *const NSTextField);
+            let _: () = msg_send![label, setStringValue: &*NSString::from_str(&text)];
+        }
+    }
+}
+
+fn publish_worker_performance(snapshot: &PerformanceSnapshot) {
+    let Some(runtime_dir) = std::env::var_os("COCOA_WAY_DISPLAY_RUNTIME_DIR") else {
+        return;
+    };
+    let runtime_dir = std::path::PathBuf::from(runtime_dir);
+    let destination = runtime_dir.join("display-performance.json");
+    let temporary = runtime_dir.join("display-performance.tmp");
+    let Ok(payload) = serde_json::to_vec(snapshot) else {
+        return;
+    };
+    if std::fs::write(&temporary, payload).is_ok() {
+        let _ = std::fs::rename(temporary, destination);
+    }
+}
+
+fn worker_performance_snapshot(runtime_dir: &str) -> Option<PerformanceSnapshot> {
+    let payload =
+        std::fs::read(std::path::Path::new(runtime_dir).join("display-performance.json")).ok()?;
+    let snapshot = serde_json::from_slice::<PerformanceSnapshot>(&payload).ok()?;
+    (now_unix_ms().saturating_sub(snapshot.sampled_at_unix_ms) <= 5_000).then_some(snapshot)
+}
+
+fn active_session_performance(index: usize) -> Option<PerformanceSnapshot> {
+    let active = active_session(index)?;
+    performance_for_active_session(&active)
+}
+
+fn performance_for_active_session(active: &ActiveSessionSnapshot) -> Option<PerformanceSnapshot> {
+    active
+        .display_runtime_dir
+        .as_deref()
+        .and_then(worker_performance_snapshot)
+        .or_else(|| {
+            (active.instance.display_slot == "default")
+                .then(performance_snapshot)
+                .flatten()
+        })
+}
+
+fn summary_performance_snapshot() -> Option<PerformanceSnapshot> {
+    if let Some(index) = *SELECTED_SESSION.lock().unwrap()
+        && let Some(snapshot) = active_session_performance(index)
+    {
+        return Some(snapshot);
+    }
+    active_sessions_snapshot()
+        .into_iter()
+        .filter_map(|active| {
+            active
+                .display_runtime_dir
+                .as_deref()
+                .and_then(worker_performance_snapshot)
+        })
+        .max_by(|left, right| left.redraw_fps.total_cmp(&right.redraw_fps))
+        .or_else(performance_snapshot)
 }
 
 pub(crate) fn control_performance_snapshot()
@@ -284,19 +828,96 @@ pub(crate) fn control_performance_snapshot()
     })
 }
 
+pub(crate) fn control_display_performance() -> Vec<(String, f64, f64, f64, f64, Option<f64>, u128)>
+{
+    let mut displays = Vec::new();
+    if let Some(snapshot) = performance_snapshot() {
+        displays.push((
+            "default".into(),
+            snapshot.redraw_fps,
+            snapshot.commits_per_second,
+            snapshot.late_redraws_per_second,
+            snapshot.max_redraw_wait_ms,
+            snapshot.input_to_present_ms,
+            snapshot.sampled_at_unix_ms,
+        ));
+    }
+    for active in active_sessions_snapshot() {
+        if active.instance.display_slot == "default"
+            || displays
+                .iter()
+                .any(|(slot, ..)| slot == &active.instance.display_slot)
+        {
+            continue;
+        }
+        if let Some(snapshot) = performance_for_active_session(&active) {
+            displays.push((
+                active.instance.display_slot,
+                snapshot.redraw_fps,
+                snapshot.commits_per_second,
+                snapshot.late_redraws_per_second,
+                snapshot.max_redraw_wait_ms,
+                snapshot.input_to_present_ms,
+                snapshot.sampled_at_unix_ms,
+            ));
+        }
+    }
+    for display in managed_displays_snapshot() {
+        if displays.iter().any(|(slot, ..)| slot == &display.slot) {
+            continue;
+        }
+        if let Some(snapshot) = worker_performance_snapshot(&display.runtime_dir) {
+            displays.push((
+                display.slot,
+                snapshot.redraw_fps,
+                snapshot.commits_per_second,
+                snapshot.late_redraws_per_second,
+                snapshot.max_redraw_wait_ms,
+                snapshot.input_to_present_ms,
+                snapshot.sampled_at_unix_ms,
+            ));
+        }
+    }
+    displays
+}
+
 pub fn record_active_container_sessions(
-    sessions: Vec<(usize, Option<u32>, u32, String, Option<u32>)>,
+    sessions: Vec<(
+        u64,
+        usize,
+        u128,
+        Option<u32>,
+        u32,
+        String,
+        Option<u32>,
+        Option<String>,
+    )>,
 ) {
     let snapshots = sessions
         .into_iter()
         .map(
-            |(index, container_pid, waypipe_pid, display_slot, display_pid)| {
+            |(
+                instance_id,
+                profile_index,
+                started_at_unix_ms,
+                container_pid,
+                waypipe_pid,
+                display_slot,
+                display_pid,
+                display_runtime_dir,
+            )| {
                 ActiveSessionSnapshot {
-                    index,
-                    container_pid,
-                    waypipe_pid,
-                    display_slot,
-                    display_pid,
+                    instance: ApplicationInstanceSnapshot {
+                        id: instance_id,
+                        profile_index,
+                        status: InstanceStatus::Running,
+                        started_at_unix_ms,
+                        container_pid,
+                        waypipe_pid,
+                        display_slot,
+                        display_pid,
+                    },
+                    display_runtime_dir,
                 }
             },
         )
@@ -362,6 +983,10 @@ pub fn record_managed_displays(displays: Vec<(String, String, String, u32)>) {
         .lock()
         .unwrap()
         .retain(|slot| !active_slots.contains(&slot.as_str()));
+    CLOSING_MANAGED_DISPLAYS
+        .lock()
+        .unwrap()
+        .retain(|slot| active_slots.contains(&slot.as_str()));
     unsafe {
         refresh_window_without_focus_throttled(Duration::from_millis(100));
     }
@@ -369,6 +994,10 @@ pub fn record_managed_displays(displays: Vec<(String, String, String, u32)>) {
 
 pub fn record_managed_display_failure(slot: &str, error: &str) {
     PENDING_MANAGED_DISPLAYS
+        .lock()
+        .unwrap()
+        .retain(|candidate| candidate != slot);
+    CLOSING_MANAGED_DISPLAYS
         .lock()
         .unwrap()
         .retain(|candidate| candidate != slot);
@@ -382,6 +1011,10 @@ pub fn record_managed_display_failure(slot: &str, error: &str) {
 
 pub fn record_managed_display_exit(slot: &str, reason: &str) {
     PENDING_MANAGED_DISPLAYS
+        .lock()
+        .unwrap()
+        .retain(|candidate| candidate != slot);
+    CLOSING_MANAGED_DISPLAYS
         .lock()
         .unwrap()
         .retain(|candidate| candidate != slot);
@@ -399,12 +1032,63 @@ fn pending_managed_displays_snapshot() -> Vec<String> {
     PENDING_MANAGED_DISPLAYS.lock().unwrap().clone()
 }
 
+fn closing_managed_displays_snapshot() -> Vec<String> {
+    CLOSING_MANAGED_DISPLAYS.lock().unwrap().clone()
+}
+
+pub(crate) fn control_managed_displays() -> Vec<(
+    String,
+    DisplayStatus,
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    usize,
+)> {
+    let active = active_sessions_snapshot();
+    let closing = closing_managed_displays_snapshot();
+    let mut displays = pending_managed_displays_snapshot()
+        .into_iter()
+        .map(|slot| (slot, DisplayStatus::Allocating, None, None, None, 0))
+        .collect::<Vec<_>>();
+    displays.extend(managed_displays_snapshot().into_iter().map(|display| {
+        let attachments = active
+            .iter()
+            .filter(|session| session.instance.display_slot == display.slot)
+            .count();
+        let status = if closing.iter().any(|slot| slot == &display.slot) {
+            DisplayStatus::Closing
+        } else if attachments > 0 {
+            DisplayStatus::Attached
+        } else {
+            DisplayStatus::Free
+        };
+        (
+            display.slot,
+            status,
+            Some(display.runtime_dir),
+            Some(display.display),
+            Some(display.pid),
+            attachments,
+        )
+    }));
+    displays
+}
+
+pub(crate) fn control_runtime_states() -> Vec<(String, RuntimeStatus, String)> {
+    RUNTIME_SYSTEM_STATES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|state| (state.runtime.clone(), state.status, state.detail.clone()))
+        .collect()
+}
+
 fn active_session(index: usize) -> Option<ActiveSessionSnapshot> {
     ACTIVE_SESSIONS
         .lock()
         .unwrap()
         .iter()
-        .find(|session| session.index == index)
+        .find(|session| session.instance.profile_index == index)
         .cloned()
 }
 
@@ -412,16 +1096,19 @@ fn active_sessions_snapshot() -> Vec<ActiveSessionSnapshot> {
     ACTIVE_SESSIONS.lock().unwrap().clone()
 }
 
-pub(crate) fn control_active_sessions() -> Vec<(usize, Option<u32>, u32, String, Option<u32>)> {
+pub(crate) fn control_active_sessions()
+-> Vec<(u64, usize, u128, Option<u32>, u32, String, Option<u32>)> {
     active_sessions_snapshot()
         .into_iter()
         .map(|session| {
             (
-                session.index,
-                session.container_pid,
-                session.waypipe_pid,
-                session.display_slot,
-                session.display_pid,
+                session.instance.id,
+                session.instance.profile_index,
+                session.instance.started_at_unix_ms,
+                session.instance.container_pid,
+                session.instance.waypipe_pid,
+                session.instance.display_slot,
+                session.instance.display_pid,
             )
         })
         .collect()
@@ -433,25 +1120,16 @@ pub(crate) fn control_session_state(index: usize) -> Option<(String, String)> {
         .unwrap()
         .iter()
         .find(|(stored, _)| *stored == index)
-        .map(|(_, state)| (state.label.to_string(), state.detail.clone()))
-}
-
-fn active_display_session_count(sessions: &[ContainerSession]) -> usize {
-    ACTIVE_SESSIONS
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|active| active.display_slot == "default" && sessions.get(active.index).is_some())
-        .count()
+        .map(|(_, state)| (session_state_label(state).to_string(), state.detail.clone()))
 }
 
 fn active_display_conflict(index: usize) -> Option<String> {
     let sessions = container_sessions::load_sessions();
     let requested = sessions.get(index)?;
     let active_sessions = ACTIVE_SESSIONS.lock().unwrap();
-    let default_in_use = active_sessions
-        .iter()
-        .any(|active| active.index != index && active.display_slot == "default");
+    let default_in_use = active_sessions.iter().any(|active| {
+        active.instance.profile_index != index && active.instance.display_slot == "default"
+    });
     let requested_target = session_display_target(requested);
     let requested_slot = match requested_target.as_str() {
         "auto" if !default_in_use => "default".to_string(),
@@ -463,15 +1141,17 @@ fn active_display_conflict(index: usize) -> Option<String> {
     };
     active_sessions
         .iter()
-        .find(|active| active.index != index && active.display_slot == requested_slot)
+        .find(|active| {
+            active.instance.profile_index != index && active.instance.display_slot == requested_slot
+        })
         .and_then(|active| {
             sessions
-                .get(active.index)
+                .get(active.instance.profile_index)
                 .map(|session| session.name.clone())
         })
 }
 
-unsafe fn rebuild_window_throttled(interval: Duration) {
+unsafe fn rebuild_window_throttled(interval: Duration) -> bool {
     let now = Instant::now();
     let mut last = LAST_STREAM_REBUILD.lock().unwrap();
     let should_rebuild = last
@@ -483,6 +1163,7 @@ unsafe fn rebuild_window_throttled(interval: Duration) {
             rebuild_window();
         }
     }
+    should_rebuild
 }
 
 unsafe fn refresh_window_without_focus_throttled(interval: Duration) {
@@ -632,6 +1313,25 @@ fn smoke_image_reference() -> &'static str {
     "localhost/cocoa-way-niri:latest"
 }
 
+fn preferred_gui_image_reference() -> String {
+    let child_path = build_child_path();
+    let references = apple_container_image_rows(&child_path)
+        .into_iter()
+        .filter_map(|row| row.reference)
+        .collect::<Vec<_>>();
+
+    references
+        .iter()
+        .find(|reference| reference.as_str() == smoke_image_reference())
+        .or_else(|| {
+            references
+                .iter()
+                .find(|reference| reference.contains("cocoa-way-niri"))
+        })
+        .cloned()
+        .unwrap_or_else(|| smoke_image_reference().into())
+}
+
 fn smoke_containerfile_path() -> &'static str {
     "examples/container-images/Containerfile.niri"
 }
@@ -678,6 +1378,7 @@ fn smoke_session() -> ContainerSession {
         image: smoke_image_reference().into(),
         runtime: "container".into(),
         display: Some("auto".into()),
+        presentation: Some("desktop".into()),
         profile: Some("niri".into()),
         app: None,
         command: Some("niri".into()),
@@ -686,6 +1387,7 @@ fn smoke_session() -> ContainerSession {
         waypipe_path: None,
         waypipe_compress: None,
         waypipe_threads: None,
+        audio: true,
         runtime_args: default_gui_runtime_args("container", Some("niri")),
         mounts: Vec::new(),
         env: Vec::new(),
@@ -709,7 +1411,11 @@ fn add_or_select_smoke_session() {
         Ok(()) => {
             let sessions = container_sessions::load_sessions();
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = sessions.len().checked_sub(1);
+            let index = sessions.len().checked_sub(1);
+            *SELECTED_SESSION.lock().unwrap() = index;
+            if let Some(index) = index {
+                invalidate_profile_validation(index);
+            }
             push_activity(format!("Restored example session: {}", session.image));
         }
         Err(error) => {
@@ -720,13 +1426,45 @@ fn add_or_select_smoke_session() {
     }
 }
 
+fn state_from_legacy_label(label: &str) -> (ProfileStatus, Option<InstanceStatus>) {
+    match label {
+        "Starting" | "Checking" => (ProfileStatus::Ready, Some(InstanceStatus::Starting)),
+        "Running" => (ProfileStatus::Ready, Some(InstanceStatus::Running)),
+        "Stopping" => (ProfileStatus::Ready, Some(InstanceStatus::Stopping)),
+        "Stopped" | "Exited" => (ProfileStatus::Ready, Some(InstanceStatus::Exited)),
+        "Error" | "Blocked" | "Failed" => (ProfileStatus::Invalid, Some(InstanceStatus::Failed)),
+        _ => (ProfileStatus::Ready, None),
+    }
+}
+
+fn session_state_label(state: &SessionState) -> &'static str {
+    state
+        .instance
+        .map(InstanceStatus::label)
+        .unwrap_or_else(|| state.profile.label())
+}
+
 fn set_session_state(index: usize, label: &'static str, detail: String) {
+    let (profile, instance) = state_from_legacy_label(label);
     let mut states = SESSION_STATES.lock().unwrap();
     if let Some((_, state)) = states.iter_mut().find(|(stored, _)| *stored == index) {
-        state.label = label;
+        state.profile = profile;
+        state.instance = instance;
         state.detail = detail;
+        if instance != Some(InstanceStatus::Stopping) {
+            state.force_stop_available = false;
+        }
     } else {
-        states.push((index, SessionState { label, detail }));
+        states.push((
+            index,
+            SessionState {
+                profile,
+                instance,
+                detail,
+                failed_step: None,
+                force_stop_available: false,
+            },
+        ));
     }
 }
 
@@ -757,22 +1495,32 @@ fn apple_transport_blocked_detail(session: &ContainerSession) -> String {
 
 fn session_can_stop(state: Option<&SessionState>) -> bool {
     state
-        .map(|state| matches!(state.label, "Starting" | "Running" | "Stopping"))
+        .and_then(|state| state.instance)
+        .map(InstanceStatus::is_active)
         .unwrap_or(false)
 }
 
 fn session_is_launch_busy(state: Option<&SessionState>) -> bool {
     state
-        .map(|state| matches!(state.label, "Starting" | "Running" | "Stopping"))
+        .and_then(|state| state.instance)
+        .map(InstanceStatus::is_active)
         .unwrap_or(false)
 }
 
+fn checked_instance_status(
+    runtime_running: bool,
+    tracked_by_this_process: bool,
+) -> Option<InstanceStatus> {
+    (runtime_running && tracked_by_this_process).then_some(InstanceStatus::Running)
+}
+
 pub fn record_launch_success(index: usize, report: &container_sessions::LaunchReport) {
+    invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!(
         "{} is running. Runtime: {}; container: {}; command: {}; host socket: {}; container socket: {}; waypipe pid: {}",
         name,
@@ -784,6 +1532,11 @@ pub fn record_launch_success(index: usize, report: &container_sessions::LaunchRe
         report.waypipe_child.id()
     );
     set_session_state(index, "Running", detail.clone());
+    finish_operation_task(
+        &launch_task_key(index),
+        TaskStatus::Completed,
+        format!("{} is running", name),
+    );
     push_activity(format!("Started: {}", detail));
     unsafe {
         rebuild_window();
@@ -812,6 +1565,11 @@ pub fn record_launch_blocked(index: usize, detail: &str) {
     *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
     *SELECTED_SESSION.lock().unwrap() = Some(index);
     set_session_state(index, "Blocked", detail.into());
+    finish_operation_task(
+        &launch_task_key(index),
+        TaskStatus::Failed,
+        detail.to_string(),
+    );
     push_activity(format!("Launch blocked: {}", detail));
     unsafe {
         rebuild_window();
@@ -823,8 +1581,16 @@ pub fn record_check_success(index: usize, report: &container_sessions::CheckRepo
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
-    let status = if report.running { "running" } else { "ready" };
+        .unwrap_or("Unknown application");
+    let tracked = active_session(index).is_some();
+    let instance = checked_instance_status(report.running, tracked);
+    let status = if instance == Some(InstanceStatus::Running) {
+        "running and tracked by this Cocoa-Way process"
+    } else if report.running {
+        "ready; an untracked instance from an earlier run will be replaced on launch"
+    } else {
+        "ready"
+    };
     let detail = format!(
         "{} is {}. Runtime: {}; container: {}; image: {}; command: {}; waypipe: {}; runtime binary: {}",
         name,
@@ -838,10 +1604,14 @@ pub fn record_check_success(index: usize, report: &container_sessions::CheckRepo
     );
     set_session_state(
         index,
-        if report.running { "Running" } else { "Ready" },
+        instance.map(InstanceStatus::label).unwrap_or("Ready"),
         detail.clone(),
     );
-    push_activity(format!("Check passed: {}", detail));
+    AUTO_VALIDATION_REQUESTED
+        .lock()
+        .unwrap()
+        .retain(|stored| *stored != index);
+    push_activity(format!("Profile validated: {}", detail));
     unsafe {
         rebuild_window();
     }
@@ -852,7 +1622,7 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("{} check failed: {}", name, error);
     *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
     *SELECTED_SESSION.lock().unwrap() = Some(index);
@@ -864,6 +1634,20 @@ pub fn record_check_failure(index: usize, error: &container_sessions::LaunchErro
         "Error"
     };
     set_session_state(index, label, detail.clone());
+    if let Some((_, state)) = SESSION_STATES
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(stored, _)| *stored == index)
+    {
+        state.profile = ProfileStatus::Invalid;
+        state.instance = None;
+        state.failed_step = Some(LaunchStep::ValidateProfile);
+    }
+    AUTO_VALIDATION_REQUESTED
+        .lock()
+        .unwrap()
+        .retain(|stored| *stored != index);
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -875,7 +1659,7 @@ pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchErr
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("{} failed to start: {}", name, error);
     *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
     *SELECTED_SESSION.lock().unwrap() = Some(index);
@@ -887,6 +1671,15 @@ pub fn record_launch_failure(index: usize, error: &container_sessions::LaunchErr
         "Error"
     };
     set_session_state(index, label, detail.clone());
+    if let Some((_, state)) = SESSION_STATES
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|(stored, _)| *stored == index)
+    {
+        state.instance = Some(InstanceStatus::Failed);
+    }
+    finish_operation_task(&launch_task_key(index), TaskStatus::Failed, detail.clone());
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -902,6 +1695,19 @@ pub fn record_session_log(index: usize, source: &str, line: &str) {
 }
 
 pub fn record_image_pull_started(runtime: &str, image: &str, configure_session: bool) {
+    let key = resource_task_key("image", "pull", runtime, image);
+    start_operation_task(
+        &key,
+        "Pull Image",
+        image,
+        ["Resolve runtime", "Transfer image", "Refresh inventory"],
+    );
+    update_operation_task_step(
+        &key,
+        "Transfer image",
+        TaskStepStatus::Running,
+        Some(format!("Pulling from {}.", runtime_label(runtime))),
+    );
     set_image_task_active(format!("Pulling {} image {}...", runtime, image));
     if configure_session {
         PENDING_PULL_SESSION
@@ -919,6 +1725,12 @@ pub fn record_image_pull_log(runtime: &str, image: &str, line: &str) {
     let line = clean_session_log_line(line);
     if !line.is_empty() {
         set_image_task_detail(line.clone());
+        update_operation_task_step(
+            &resource_task_key("image", "pull", runtime, image),
+            "Transfer image",
+            TaskStepStatus::Running,
+            Some(line.clone()),
+        );
     }
     push_activity(format!("pull {} {}: {}", runtime, image, line));
     unsafe {
@@ -927,6 +1739,7 @@ pub fn record_image_pull_log(runtime: &str, image: &str, line: &str) {
 }
 
 pub fn record_image_pull_finished(runtime: &str, image: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     let configure_session = {
         let mut pending = PENDING_PULL_SESSION.lock().unwrap();
         pending
@@ -939,6 +1752,15 @@ pub fn record_image_pull_finished(runtime: &str, image: &str, success: bool, sta
     };
     clear_image_task_active();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("image", "pull", runtime, image),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!(
         "Pull {}: {} image {} ({})",
         state, runtime, image, status
@@ -952,6 +1774,19 @@ pub fn record_image_pull_finished(runtime: &str, image: &str, success: bool, sta
 }
 
 pub fn record_image_load_started(path: &str) {
+    let key = resource_task_key("image", "load", "apple", path);
+    start_operation_task(
+        &key,
+        "Import OCI Image",
+        path,
+        ["Read archive", "Import image", "Refresh inventory"],
+    );
+    update_operation_task_step(
+        &key,
+        "Import image",
+        TaskStepStatus::Running,
+        Some("Loading the OCI archive into Apple Container.".into()),
+    );
     set_image_task_active(format!("Loading OCI archive {}...", path));
     push_activity(format!("Image load started: {}", path));
     unsafe {
@@ -960,6 +1795,12 @@ pub fn record_image_load_started(path: &str) {
 }
 
 pub fn record_image_load_log(path: &str, line: &str) {
+    update_operation_task_step(
+        &resource_task_key("image", "load", "apple", path),
+        "Import image",
+        TaskStepStatus::Running,
+        Some(clean_session_log_line(line)),
+    );
     push_activity(format!("load {}: {}", path, line));
     unsafe {
         rebuild_window_throttled(Duration::from_millis(500));
@@ -967,8 +1808,18 @@ pub fn record_image_load_log(path: &str, line: &str) {
 }
 
 pub fn record_image_load_finished(path: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     clear_image_task_active();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("image", "load", "apple", path),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!("Image load {}: {} ({})", state, path, status));
     unsafe {
         rebuild_window();
@@ -976,6 +1827,24 @@ pub fn record_image_load_finished(path: &str, success: bool, status: &str) {
 }
 
 pub fn record_image_build_started(image: &str, containerfile: &str) {
+    let key = resource_task_key("image", "build", "apple", image);
+    start_operation_task(
+        &key,
+        "Build Image",
+        image,
+        [
+            "Read Containerfile",
+            "Build layers",
+            "Tag image",
+            "Refresh inventory",
+        ],
+    );
+    update_operation_task_step(
+        &key,
+        "Build layers",
+        TaskStepStatus::Running,
+        Some(format!("Building from {containerfile}.")),
+    );
     set_image_task_active(format!("Building {} from {}...", image, containerfile));
     push_activity(format!(
         "Image build started: {} from {}",
@@ -987,6 +1856,12 @@ pub fn record_image_build_started(image: &str, containerfile: &str) {
 }
 
 pub fn record_image_build_log(image: &str, line: &str) {
+    update_operation_task_step(
+        &resource_task_key("image", "build", "apple", image),
+        "Build layers",
+        TaskStepStatus::Running,
+        Some(clean_session_log_line(line)),
+    );
     push_activity(format!("build {}: {}", image, line));
     unsafe {
         rebuild_window_throttled(Duration::from_millis(500));
@@ -994,8 +1869,18 @@ pub fn record_image_build_log(image: &str, line: &str) {
 }
 
 pub fn record_image_build_finished(image: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     clear_image_task_active();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("image", "build", "apple", image),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!("Image build {}: {} ({})", state, image, status));
     unsafe {
         rebuild_window();
@@ -1022,6 +1907,24 @@ fn allow_storage_growth(action: &str) -> bool {
 }
 
 pub fn record_apple_container_system_start_started() {
+    set_runtime_system_state(
+        "apple",
+        RuntimeStatus::Starting,
+        "Starting the Apple Container runtime.",
+    );
+    let key = runtime_task_key("apple");
+    start_operation_task(
+        &key,
+        "Start Runtime",
+        "Apple Container",
+        ["Run runtime command", "Refresh runtime health"],
+    );
+    update_operation_task_step(
+        &key,
+        "Run runtime command",
+        TaskStepStatus::Running,
+        Some("Running `container system start`.".into()),
+    );
     push_activity("Apple Container system start requested.".into());
     unsafe {
         rebuild_window();
@@ -1036,7 +1939,26 @@ pub fn record_apple_container_system_start_log(line: &str) {
 }
 
 pub fn record_apple_container_system_start_finished(success: bool, status: &str) {
+    invalidate_ui_command_cache();
     let state = if success { "finished" } else { "failed" };
+    set_runtime_system_state(
+        "apple",
+        if success {
+            RuntimeStatus::Ready
+        } else {
+            RuntimeStatus::Failed
+        },
+        status,
+    );
+    finish_operation_task(
+        &runtime_task_key("apple"),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!(
         "Apple Container system start {} ({})",
         state, status
@@ -1047,6 +1969,19 @@ pub fn record_apple_container_system_start_finished(success: bool, status: &str)
 }
 
 pub fn record_image_delete_started(runtime: &str, image: &str) {
+    let key = resource_task_key("image", "delete", runtime, image);
+    start_operation_task(
+        &key,
+        "Delete Image",
+        image,
+        ["Check dependencies", "Delete image", "Refresh inventory"],
+    );
+    update_operation_task_step(
+        &key,
+        "Delete image",
+        TaskStepStatus::Running,
+        Some(format!("Deleting from {}.", runtime_label(runtime))),
+    );
     set_image_task_active(format!("Deleting {} image {}...", runtime, image));
     push_activity(format!("Image delete started: {} {}", runtime, image));
     unsafe {
@@ -1054,16 +1989,32 @@ pub fn record_image_delete_started(runtime: &str, image: &str) {
     }
 }
 
-pub fn record_image_delete_log(_runtime: &str, image: &str, line: &str) {
+pub fn record_image_delete_log(runtime: &str, image: &str, line: &str) {
+    update_operation_task_step(
+        &resource_task_key("image", "delete", runtime, image),
+        "Delete image",
+        TaskStepStatus::Running,
+        Some(clean_session_log_line(line)),
+    );
     push_activity(format!("delete image {}: {}", image, line));
     unsafe {
         rebuild_window_throttled(Duration::from_millis(500));
     }
 }
 
-pub fn record_image_delete_finished(_runtime: &str, image: &str, success: bool, status: &str) {
+pub fn record_image_delete_finished(runtime: &str, image: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     clear_image_task_active();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("image", "delete", runtime, image),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!("Image delete {}: {} ({})", state, image, status));
     unsafe {
         rebuild_window();
@@ -1071,21 +2022,50 @@ pub fn record_image_delete_finished(_runtime: &str, image: &str, success: bool, 
 }
 
 pub fn record_volume_delete_started(runtime: &str, volume: &str) {
+    let key = resource_task_key("volume", "delete", runtime, volume);
+    start_operation_task(
+        &key,
+        "Delete Volume",
+        volume,
+        ["Check usage", "Delete volume", "Refresh inventory"],
+    );
+    update_operation_task_step(
+        &key,
+        "Delete volume",
+        TaskStepStatus::Running,
+        Some(format!("Deleting from {}.", runtime_label(runtime))),
+    );
     push_activity(format!("Volume delete started: {} {}", runtime, volume));
     unsafe {
         rebuild_window();
     }
 }
 
-pub fn record_volume_delete_log(_runtime: &str, volume: &str, line: &str) {
+pub fn record_volume_delete_log(runtime: &str, volume: &str, line: &str) {
+    update_operation_task_step(
+        &resource_task_key("volume", "delete", runtime, volume),
+        "Delete volume",
+        TaskStepStatus::Running,
+        Some(clean_session_log_line(line)),
+    );
     push_activity(format!("delete volume {}: {}", volume, line));
     unsafe {
         rebuild_window();
     }
 }
 
-pub fn record_volume_delete_finished(_runtime: &str, volume: &str, success: bool, status: &str) {
+pub fn record_volume_delete_finished(runtime: &str, volume: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("volume", "delete", runtime, volume),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!("Volume delete {}: {} ({})", state, volume, status));
     unsafe {
         rebuild_window();
@@ -1093,21 +2073,50 @@ pub fn record_volume_delete_finished(_runtime: &str, volume: &str, success: bool
 }
 
 pub fn record_volume_create_started(runtime: &str, volume: &str) {
+    let key = resource_task_key("volume", "create", runtime, volume);
+    start_operation_task(
+        &key,
+        "Create Volume",
+        volume,
+        ["Validate name", "Create volume", "Refresh inventory"],
+    );
+    update_operation_task_step(
+        &key,
+        "Create volume",
+        TaskStepStatus::Running,
+        Some(format!("Creating in {}.", runtime_label(runtime))),
+    );
     push_activity(format!("Volume create started: {} {}", runtime, volume));
     unsafe {
         rebuild_window();
     }
 }
 
-pub fn record_volume_create_log(_runtime: &str, volume: &str, line: &str) {
+pub fn record_volume_create_log(runtime: &str, volume: &str, line: &str) {
+    update_operation_task_step(
+        &resource_task_key("volume", "create", runtime, volume),
+        "Create volume",
+        TaskStepStatus::Running,
+        Some(clean_session_log_line(line)),
+    );
     push_activity(format!("create volume {}: {}", volume, line));
     unsafe {
         rebuild_window_throttled(Duration::from_millis(500));
     }
 }
 
-pub fn record_volume_create_finished(_runtime: &str, volume: &str, success: bool, status: &str) {
+pub fn record_volume_create_finished(runtime: &str, volume: &str, success: bool, status: &str) {
+    invalidate_ui_command_cache();
     let state = if success { "finished" } else { "failed" };
+    finish_operation_task(
+        &resource_task_key("volume", "create", runtime, volume),
+        if success {
+            TaskStatus::Completed
+        } else {
+            TaskStatus::Failed
+        },
+        status,
+    );
     push_activity(format!("Volume create {}: {} ({})", state, volume, status));
     unsafe {
         rebuild_window();
@@ -1146,6 +2155,7 @@ pub fn record_runtime_container_action_finished(
     success: bool,
     status: &str,
 ) {
+    invalidate_ui_command_cache();
     let state = if success { "finished" } else { "failed" };
     push_activity(format!(
         "{} container {} {}: {} ({})",
@@ -1231,7 +2241,61 @@ pub fn record_runtime_container_terminal_failed(runtime: &str, name: &str, error
     }
 }
 
+pub fn record_runtime_machine_terminal_opened(runtime: &str, name: &str) {
+    push_activity(format!(
+        "Opened a {} machine shell for {}.",
+        runtime_label(runtime),
+        name
+    ));
+    unsafe {
+        rebuild_window();
+    }
+}
+
+pub fn record_runtime_machine_terminal_failed(runtime: &str, name: &str, error: &str) {
+    push_activity(format!(
+        "Could not open a {} machine shell for {}: {}",
+        runtime_label(runtime),
+        name,
+        error
+    ));
+    show_error_alert(&format!("Could not open machine shell: {}", error));
+    unsafe {
+        rebuild_window();
+    }
+}
+
 pub fn record_runtime_system_action_started(runtime: &str, action: &str) {
+    if matches!(action, "start" | "stop") {
+        let status = if action == "start" {
+            RuntimeStatus::Starting
+        } else {
+            RuntimeStatus::Stopping
+        };
+        let runtime_name = runtime_label(runtime);
+        set_runtime_system_state(
+            runtime,
+            status,
+            format!("{} runtime {} is in progress.", runtime_name, action),
+        );
+        let key = runtime_task_key(runtime);
+        start_operation_task(
+            &key,
+            if action == "start" {
+                "Start Runtime"
+            } else {
+                "Stop Runtime"
+            },
+            runtime_name,
+            ["Run runtime command", "Refresh runtime health"],
+        );
+        update_operation_task_step(
+            &key,
+            "Run runtime command",
+            TaskStepStatus::Running,
+            Some(format!("Running runtime {} command.", action)),
+        );
+    }
     push_activity(format!(
         "{} system {} started",
         runtime_label(runtime),
@@ -1260,6 +2324,31 @@ pub fn record_runtime_system_action_finished(
     success: bool,
     status: &str,
 ) {
+    invalidate_ui_command_cache();
+    if matches!(action, "start" | "stop") {
+        set_runtime_system_state(
+            runtime,
+            if success {
+                if action == "start" {
+                    RuntimeStatus::Ready
+                } else {
+                    RuntimeStatus::Unavailable
+                }
+            } else {
+                RuntimeStatus::Failed
+            },
+            status,
+        );
+        finish_operation_task(
+            &runtime_task_key(runtime),
+            if success {
+                TaskStatus::Completed
+            } else {
+                TaskStatus::Failed
+            },
+            status,
+        );
+    }
     push_activity(format!(
         "{} system {} {} ({})",
         runtime_label(runtime),
@@ -1273,13 +2362,15 @@ pub fn record_runtime_system_action_finished(
 }
 
 pub fn record_stop_success(index: usize) {
+    invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("{} stopped.", name);
     set_session_state(index, "Stopped", detail.clone());
+    finish_operation_task(&stop_task_key(index), TaskStatus::Completed, detail.clone());
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -1291,9 +2382,10 @@ pub fn record_stop_failure(index: usize, error: &str) {
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("{} stop failed: {}", name, error);
     set_session_state(index, "Error", detail.clone());
+    finish_operation_task(&stop_task_key(index), TaskStatus::Failed, detail.clone());
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -1305,7 +2397,7 @@ pub fn record_terminal_opened(index: usize) {
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     push_activity(format!("Terminal opened for {}.", name));
     unsafe {
         rebuild_window();
@@ -1317,7 +2409,7 @@ pub fn record_terminal_open_failed(index: usize, error: &str) {
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("Terminal failed for {}: {}", name, error);
     push_activity(detail.clone());
     set_session_state(index, "Error", detail);
@@ -1327,13 +2419,15 @@ pub fn record_terminal_open_failed(index: usize, error: &str) {
 }
 
 pub fn record_process_exit(index: usize, process: &str, status: &str) {
+    invalidate_ui_command_cache();
     let sessions = container_sessions::load_sessions();
     let name = sessions
         .get(index)
         .map(|session| session.name.as_str())
-        .unwrap_or("Unknown session");
+        .unwrap_or("Unknown application");
     let detail = format!("{} exited because {} ended with {}.", name, process, status);
     set_session_state(index, "Exited", detail.clone());
+    finish_operation_task(&stop_task_key(index), TaskStatus::Completed, detail.clone());
     push_activity(detail);
     unsafe {
         rebuild_window();
@@ -1342,18 +2436,20 @@ pub fn record_process_exit(index: usize, process: &str, status: &str) {
 
 unsafe fn show_add_session_dialog() {
     unsafe {
-        show_add_session_dialog_with_defaults(AddSessionDefaults::default());
+        let image = preferred_gui_image_reference();
+        show_add_session_dialog_with_defaults(session_defaults_for_image("container", &image));
     }
 }
 
 unsafe fn show_new_image_session_dialog() {
     unsafe {
+        let image = preferred_gui_image_reference();
         show_add_session_dialog_with_defaults(AddSessionDefaults {
             name: "Niri Desktop".into(),
             runtime: "container".into(),
             display: "auto".into(),
             profile: "niri".into(),
-            image: smoke_image_reference().into(),
+            image,
             command: "niri".into(),
             ..AddSessionDefaults::default()
         });
@@ -1369,7 +2465,7 @@ unsafe fn show_add_session_dialog_with_defaults(defaults: AddSessionDefaults) {
 unsafe fn show_edit_session_dialog(index: usize) {
     let sessions = container_sessions::load_sessions();
     let Some(session) = sessions.get(index).cloned() else {
-        show_error_alert("Session no longer exists.");
+        show_error_alert("Application profile no longer exists.");
         return;
     };
     unsafe {
@@ -1380,7 +2476,7 @@ unsafe fn show_edit_session_dialog(index: usize) {
 unsafe fn duplicate_session_profile(index: usize) {
     let sessions = container_sessions::load_sessions();
     let Some(source) = sessions.get(index).cloned() else {
-        show_error_alert("Session no longer exists.");
+        show_error_alert("Application profile no longer exists.");
         return;
     };
     let mut duplicate = source.clone();
@@ -1390,8 +2486,15 @@ unsafe fn duplicate_session_profile(index: usize) {
         Ok(()) => {
             let sessions = container_sessions::load_sessions();
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() = sessions.len().checked_sub(1);
-            push_activity(format!("Duplicated session: {}", duplicate.name));
+            let index = sessions.len().checked_sub(1);
+            *SELECTED_SESSION.lock().unwrap() = index;
+            if let Some(index) = index {
+                invalidate_profile_validation(index);
+            }
+            push_activity(format!(
+                "Duplicated application profile: {}",
+                duplicate.name
+            ));
             unsafe {
                 rebuild_window();
             }
@@ -1404,11 +2507,84 @@ unsafe fn duplicate_session_profile(index: usize) {
     }
 }
 
+unsafe fn export_session_profile(index: usize) {
+    let sessions = container_sessions::load_sessions();
+    let Some(session) = sessions.get(index) else {
+        show_error_alert("Application profile no longer exists.");
+        return;
+    };
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let panel = unsafe { NSSavePanel::savePanel(mtm) };
+    let filename = format!("{}.toml", display_slot_slug(&session.name));
+    unsafe {
+        panel.setNameFieldStringValue(&NSString::from_str(&filename));
+        let _: () = msg_send![&*panel, setTitle:
+            &*NSString::from_str("Export Application Profile")];
+        let _: () = msg_send![&*panel, setMessage:
+            &*NSString::from_str("Export this saved launch configuration without images, volumes, or containers.")];
+    }
+    if unsafe { panel.runModal() } != NSModalResponseOK {
+        return;
+    }
+    let Some(url) = (unsafe { panel.URL() }) else {
+        show_error_alert("No export destination was selected.");
+        return;
+    };
+    let Some(path) = (unsafe { url.path() }) else {
+        show_error_alert("The export destination is not a local file.");
+        return;
+    };
+    match std::fs::write(
+        path.to_string(),
+        container_sessions::session_to_toml(session),
+    ) {
+        Ok(()) => push_activity(format!("Exported application profile: {}", session.name)),
+        Err(error) => show_error_alert(&format!("Failed to export profile: {}", error)),
+    }
+}
+
+unsafe fn show_raw_session_profile(index: usize) {
+    let sessions = container_sessions::load_sessions();
+    let Some(session) = sessions.get(index) else {
+        show_error_alert("Application profile no longer exists.");
+        return;
+    };
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let alert: Retained<NSAlert> = unsafe { msg_send_id![NSAlert::class(), new] };
+    unsafe {
+        let _: () = msg_send![&*alert, setMessageText:
+            &*NSString::from_str(&format!("Raw Configuration: {}", session.name))];
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str("This is the exact TOML block stored for this application profile.")];
+    }
+    let view: Retained<NSView> =
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 560.0, 300.0)] };
+    let field = add_label(
+        &view,
+        &container_sessions::session_to_toml(session),
+        rect(0.0, 0.0, 560.0, 300.0),
+        mtm,
+        TextStyle::Mono,
+    );
+    unsafe { field.setSelectable(true) };
+    unsafe {
+        let _: () = msg_send![&*alert, setAccessoryView: &*view];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Close")];
+        let _: () = msg_send![&*alert, layout];
+        let _: isize = msg_send![&*alert, runModal];
+    }
+}
+
 fn defaults_from_session(session: &ContainerSession) -> AddSessionDefaults {
     AddSessionDefaults {
         name: session.name.clone(),
         runtime: session.runtime.clone(),
         display: session.display.clone().unwrap_or_else(|| "auto".into()),
+        presentation: session
+            .presentation
+            .clone()
+            .unwrap_or_else(|| "desktop".into()),
         profile: session.profile.clone().unwrap_or_else(|| "niri".into()),
         image: session.image.clone(),
         command: session
@@ -1418,6 +2594,7 @@ fn defaults_from_session(session: &ContainerSession) -> AddSessionDefaults {
             .unwrap_or_default(),
         mounts: session.mounts.join("; "),
         env: session.env.join("; "),
+        audio: session.audio,
     }
 }
 
@@ -1453,7 +2630,7 @@ unsafe fn show_session_dialog(
     let is_edit = edit_target.is_some();
     unsafe {
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str(if is_edit { "Edit GUI Session" } else { "Add GUI Session" })];
+            &*NSString::from_str(if is_edit { "Edit Application" } else { "New Application" })];
         let _: () = msg_send![&*alert, setInformativeText:
         &*NSString::from_str(if is_edit {
             "Update this Container Mode profile. Advanced socket and waypipe fields are preserved."
@@ -1463,17 +2640,17 @@ unsafe fn show_session_dialog(
     }
 
     let view: Retained<NSView> =
-        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 334.0)] };
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 420.0, 414.0)] };
     add_label(
         &view,
         "Name",
-        rect(0.0, 305.0, 120.0, 18.0),
+        rect(0.0, 385.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let name_field = add_text_field(
         &view,
-        rect(116.0, 300.0, 304.0, 26.0),
+        rect(116.0, 380.0, 304.0, 26.0),
         "Niri Desktop",
         &defaults.name,
         mtm,
@@ -1481,13 +2658,13 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Runtime",
-        rect(0.0, 265.0, 120.0, 18.0),
+        rect(0.0, 345.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let runtime_field = add_text_field(
         &view,
-        rect(116.0, 260.0, 304.0, 26.0),
+        rect(116.0, 340.0, 304.0, 26.0),
         "container",
         if defaults.runtime.is_empty() {
             "container"
@@ -1499,13 +2676,13 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Display",
-        rect(0.0, 225.0, 120.0, 18.0),
+        rect(0.0, 305.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let display_field = add_text_field(
         &view,
-        rect(116.0, 220.0, 304.0, 26.0),
+        rect(116.0, 300.0, 304.0, 26.0),
         "auto",
         if defaults.display.is_empty() {
             "auto"
@@ -1516,14 +2693,28 @@ unsafe fn show_session_dialog(
     );
     add_label(
         &view,
+        "Presentation",
+        rect(0.0, 265.0, 120.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let presentation_popup = add_popup(
+        &view,
+        rect(116.0, 260.0, 304.0, 28.0),
+        &["Desktop", "Rootless"],
+        usize::from(defaults.presentation.eq_ignore_ascii_case("rootless")),
+        mtm,
+    );
+    add_label(
+        &view,
         "Profile",
-        rect(0.0, 185.0, 120.0, 18.0),
+        rect(0.0, 225.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let profile_field = add_text_field(
         &view,
-        rect(116.0, 180.0, 304.0, 26.0),
+        rect(116.0, 220.0, 304.0, 26.0),
         "niri / single-app / shell",
         if defaults.profile.is_empty() {
             "niri"
@@ -1535,13 +2726,13 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Image / Source",
-        rect(0.0, 145.0, 120.0, 18.0),
+        rect(0.0, 185.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let image_field = add_text_field(
         &view,
-        rect(116.0, 140.0, 304.0, 26.0),
+        rect(116.0, 180.0, 304.0, 26.0),
         smoke_image_reference(),
         &defaults.image,
         mtm,
@@ -1549,13 +2740,13 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Command",
-        rect(0.0, 105.0, 120.0, 18.0),
+        rect(0.0, 145.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let command_field = add_text_field(
         &view,
-        rect(116.0, 100.0, 304.0, 26.0),
+        rect(116.0, 140.0, 304.0, 26.0),
         "niri",
         &defaults.command,
         mtm,
@@ -1563,13 +2754,13 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Mounts",
-        rect(0.0, 65.0, 120.0, 18.0),
+        rect(0.0, 105.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let mounts_field = add_text_field(
         &view,
-        rect(116.0, 60.0, 304.0, 26.0),
+        rect(116.0, 100.0, 304.0, 26.0),
         "separate multiple mounts with ;",
         &defaults.mounts,
         mtm,
@@ -1577,15 +2768,29 @@ unsafe fn show_session_dialog(
     add_label(
         &view,
         "Env",
-        rect(0.0, 25.0, 120.0, 18.0),
+        rect(0.0, 65.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     let env_field = add_text_field(
         &view,
-        rect(116.0, 20.0, 304.0, 26.0),
+        rect(116.0, 60.0, 304.0, 26.0),
         "WAYLAND_DEBUG=1; RUST_LOG=info",
         &defaults.env,
+        mtm,
+    );
+    add_label(
+        &view,
+        "Audio",
+        rect(0.0, 25.0, 120.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let audio_popup = add_popup(
+        &view,
+        rect(116.0, 20.0, 304.0, 28.0),
+        &["Off", "Forward playback (Apple, experimental)"],
+        usize::from(defaults.audio),
         mtm,
     );
 
@@ -1606,11 +2811,17 @@ unsafe fn show_session_dialog(
     let name = field_string(&name_field);
     let runtime = field_string(&runtime_field);
     let display = field_string(&display_field);
+    let presentation = if popup_index(&presentation_popup) == 1 {
+        "rootless"
+    } else {
+        "desktop"
+    };
     let profile = field_string(&profile_field);
     let image = field_string(&image_field);
     let command = field_string(&command_field);
     let mounts = semicolon_list(&field_string(&mounts_field));
     let env = semicolon_list(&field_string(&env_field));
+    let audio_requested = popup_index(&audio_popup) == 1;
     if image.is_empty() {
         show_error_alert("Enter an image reference before creating the session.");
         return;
@@ -1621,6 +2832,10 @@ unsafe fn show_session_dialog(
     } else {
         runtime
     };
+    if audio_requested && matches!(runtime.as_str(), "docker" | "orb" | "orbstack") {
+        show_error_alert("Audio forwarding currently requires Apple Container.");
+        return;
+    }
     let profile = normalize_profile(&profile);
     let runtime_args = default_gui_runtime_args(&runtime, profile.as_deref());
     let mut session = ContainerSession {
@@ -1636,6 +2851,7 @@ unsafe fn show_session_dialog(
         } else {
             display
         }),
+        presentation: Some(presentation.into()),
         profile,
         app: None,
         command: if command.is_empty() {
@@ -1648,6 +2864,7 @@ unsafe fn show_session_dialog(
         waypipe_path: None,
         waypipe_compress: None,
         waypipe_threads: None,
+        audio: audio_requested,
         runtime_args,
         mounts,
         env,
@@ -1670,8 +2887,11 @@ unsafe fn show_session_dialog(
         Ok(selected_index) => {
             let sessions = container_sessions::load_sessions();
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            *SELECTED_SESSION.lock().unwrap() =
-                selected_index.or_else(|| sessions.len().checked_sub(1));
+            let selected_index = selected_index.or_else(|| sessions.len().checked_sub(1));
+            *SELECTED_SESSION.lock().unwrap() = selected_index;
+            if let Some(index) = selected_index {
+                invalidate_profile_validation(index);
+            }
             push_activity(format!(
                 "{} session: {} ({})",
                 if is_edit { "Updated" } else { "Added" },
@@ -1791,7 +3011,7 @@ unsafe fn show_pull_image_dialog() {
     let after_popup = add_popup(
         &view,
         rect(116.0, 16.0, 304.0, 28.0),
-        &["Keep as a local image", "Configure a GUI session"],
+        &["Keep as a local image", "Create an application"],
         1,
         mtm,
     );
@@ -2059,11 +3279,25 @@ unsafe fn show_create_volume_dialog() {
         let _: () = msg_send![&*alert, setMessageText:
             &*NSString::from_str("Create Volume")];
         let _: () = msg_send![&*alert, setInformativeText:
-            &*NSString::from_str("Create a named volume in Apple Container or the active Docker-compatible context.")];
+            &*NSString::from_str("Choose the runtime that will own this persistent volume.")];
     }
 
     let view: Retained<NSView> =
-        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 94.0)] };
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, 380.0, 134.0)] };
+    add_label(
+        &view,
+        "Name",
+        rect(0.0, 105.0, 120.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let volume_field = add_text_field(
+        &view,
+        rect(116.0, 100.0, 264.0, 26.0),
+        "project-data",
+        "",
+        mtm,
+    );
     add_label(
         &view,
         "Runtime",
@@ -2071,26 +3305,26 @@ unsafe fn show_create_volume_dialog() {
         mtm,
         TextStyle::Caption,
     );
-    let runtime_field = add_text_field(
+    let runtime_popup = add_popup(
         &view,
         rect(116.0, 60.0, 264.0, 26.0),
-        "container",
-        "container",
+        &["Apple Container", "Docker-compatible Context"],
+        0,
         mtm,
     );
     add_label(
         &view,
-        "Volume name",
+        "Type",
         rect(0.0, 25.0, 120.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
-    let volume_field = add_text_field(
+    add_label(
         &view,
-        rect(116.0, 20.0, 264.0, 26.0),
-        "cocoa-way-data",
-        "",
+        "Managed volume",
+        rect(116.0, 22.0, 264.0, 20.0),
         mtm,
+        TextStyle::Body,
     );
 
     unsafe {
@@ -2107,17 +3341,17 @@ unsafe fn show_create_volume_dialog() {
         return;
     }
 
-    let runtime = field_string(&runtime_field);
+    let runtime_index: isize = unsafe { msg_send![&*runtime_popup, indexOfSelectedItem] };
     let volume = field_string(&volume_field);
     if volume.is_empty() {
         show_error_alert("Volume name is required.");
         return;
     }
     send(CompositorMessage::CreateContainerVolume {
-        runtime: if runtime.is_empty() {
-            "container".into()
+        runtime: if runtime_index == 1 {
+            "docker".into()
         } else {
-            runtime
+            "container".into()
         },
         volume,
     });
@@ -2126,9 +3360,13 @@ unsafe fn show_create_volume_dialog() {
 unsafe fn delete_container_session(index: usize) {
     let sessions = container_sessions::load_sessions();
     let Some(session) = sessions.get(index) else {
-        show_error_alert("Session no longer exists.");
+        show_error_alert("Application profile no longer exists.");
         return;
     };
+    if active_session(index).is_some() || session_can_stop(session_state(index).as_ref()) {
+        show_error_alert("Stop all running instances before deleting this profile.");
+        return;
+    }
     if !confirm_delete_session(&session.name) {
         return;
     }
@@ -2137,7 +3375,8 @@ unsafe fn delete_container_session(index: usize) {
         Ok(()) => {
             *SELECTED_SESSION.lock().unwrap() = None;
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
-            push_activity(format!("Deleted session: {}", session.name));
+            invalidate_all_profile_validation();
+            push_activity(format!("Deleted application profile: {}", session.name));
             unsafe {
                 rebuild_window();
             }
@@ -2154,10 +3393,10 @@ fn confirm_delete_session(name: &str) -> bool {
     unsafe {
         let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
         let _: () = msg_send![&*alert, setMessageText:
-            &*NSString::from_str("Delete GUI Session?")];
+            &*NSString::from_str(&format!("Delete profile “{}”?", name))];
         let message = format!(
-            "This removes '{}' from container-sessions.toml. It will not stop a running container.",
-            name
+            "This removes the saved launch configuration for '{}'. Images, volumes, containers, and displays will not be deleted.",
+            name,
         );
         let _: () = msg_send![&*alert, setInformativeText:
             &*NSString::from_str(&message)];
@@ -2192,6 +3431,147 @@ fn confirm_delete_resource(kind: &str, runtime: &str, name: &str) -> bool {
     }
 }
 
+fn confirm_image_removal(action: &ImageDeleteAction, remove_tag: bool) -> bool {
+    let sessions = container_sessions::load_sessions();
+    let known_references = if remove_tag {
+        vec![action.reference.clone()]
+    } else {
+        action
+            .image_id
+            .as_deref()
+            .map(|image_id| image_references_for_id(&action.runtime, image_id))
+            .filter(|references| !references.is_empty())
+            .unwrap_or_else(|| vec![action.reference.clone()])
+    };
+    let referenced = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            known_references.contains(&session.image)
+                && runtime_key_matches(&action.runtime, &session.runtime)
+        })
+        .collect::<Vec<_>>();
+    let running = referenced
+        .iter()
+        .filter(|(index, _)| active_session(*index).is_some())
+        .map(|(_, session)| session.name.as_str())
+        .collect::<Vec<_>>();
+    if !running.is_empty() {
+        show_error_alert(&format!(
+            "This image cannot be removed while it is used by running applications:\n\n{}\n\nStop those instances and try again.",
+            running
+                .iter()
+                .map(|name| format!("• {}", name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        return false;
+    }
+
+    let referenced_names = referenced
+        .iter()
+        .map(|(_, session)| session.name.as_str())
+        .collect::<Vec<_>>();
+    let tags = if remove_tag {
+        Vec::new()
+    } else {
+        known_references
+    };
+    unsafe {
+        let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
+        let title = if remove_tag {
+            format!("Remove tag “{}”?", action.reference)
+        } else {
+            "Delete image and all local data?".into()
+        };
+        let _: () = msg_send![&*alert, setMessageText: &*NSString::from_str(&title)];
+        let mut details = vec![format!("Runtime: {}", runtime_label(&action.runtime))];
+        if remove_tag {
+            details.push("Only this repository tag will be removed.".into());
+        } else if !tags.is_empty() {
+            details.push(format!("Known tags:\n{}", tags.join("\n")));
+        }
+        if !referenced_names.is_empty() {
+            details.push(format!(
+                "Referenced by saved profiles:\n{}",
+                referenced_names
+                    .iter()
+                    .map(|name| format!("• {}", name))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str(&details.join("\n\n"))];
+        let action_title = if remove_tag {
+            "Remove Tag"
+        } else {
+            "Delete Image"
+        };
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str(action_title)];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Cancel")];
+        let response: isize = msg_send![&*alert, runModal];
+        response == 1000
+    }
+}
+
+fn confirm_volume_removal(action: &VolumeDeleteAction) -> bool {
+    let usage = volume_usage(&action.runtime, &action.name);
+    if usage.loading {
+        show_error_alert(
+            "Volume usage is still loading. Wait a moment, press Reload, and try again.",
+        );
+        return false;
+    }
+    if let Some(error) = usage.error {
+        show_error_alert(&format!(
+            "Cocoa-Way could not verify whether this volume is mounted, so deletion was blocked.\n\n{}",
+            error
+        ));
+        return false;
+    }
+    if !usage.mounted_containers.is_empty() {
+        show_error_alert(&format!(
+            "This volume is mounted by:\n\n{}\n\nStop those containers before deleting the volume.",
+            usage
+                .mounted_containers
+                .iter()
+                .map(|name| format!("• {}", name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        return false;
+    }
+
+    unsafe {
+        let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
+        let _: () = msg_send![&*alert, setMessageText:
+            &*NSString::from_str(&format!("Delete volume “{}”?", action.name))];
+        let mut details = vec![format!("Runtime: {}", runtime_label(&action.runtime))];
+        if !usage.referenced_profiles.is_empty() {
+            details.push(format!(
+                "Referenced by saved application profiles:\n{}\n\nThose profiles will remain saved, but their next launch may fail until the volume is recreated.",
+                usage
+                    .referenced_profiles
+                    .iter()
+                    .map(|name| format!("• {}", name))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        let _: () = msg_send![&*alert, setInformativeText:
+            &*NSString::from_str(&details.join("\n\n"))];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Delete Volume")];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Cancel")];
+        let response: isize = msg_send![&*alert, runModal];
+        response == 1000
+    }
+}
+
 fn confirm_close_managed_display(slot: &str) -> bool {
     unsafe {
         let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
@@ -2212,6 +3592,76 @@ fn confirm_close_managed_display(slot: &str) -> bool {
     }
 }
 
+fn confirm_stop_apple_runtime() -> Option<Vec<usize>> {
+    let sessions = container_sessions::load_sessions();
+    let mut running = active_sessions_snapshot()
+        .into_iter()
+        .filter_map(|active| {
+            let session = sessions.get(active.instance.profile_index)?;
+            if normalized_runtime_key(&session.runtime) != "apple" {
+                return None;
+            }
+            Some((active.instance.profile_index, session.name.clone()))
+        })
+        .collect::<Vec<_>>();
+    running.sort_by_key(|(index, _)| *index);
+    running.dedup_by_key(|(index, _)| *index);
+    if running.is_empty() {
+        return Some(Vec::new());
+    }
+
+    unsafe {
+        let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
+        let _: () = msg_send![&*alert, setMessageText:
+        &*NSString::from_str(&format!(
+            "Apple Container has {} running Cocoa-Way instance{}.",
+            running.len(),
+            if running.len() == 1 { "" } else { "s" }
+        ))];
+        let list = running
+            .iter()
+            .map(|(_, name)| format!("• {name}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = format!(
+            "Stopping the runtime requires these application instances to be terminated first:\n\n{list}\n\nThis does not delete their saved profiles or images."
+        );
+        let _: () = msg_send![&*alert, setInformativeText: &*NSString::from_str(&detail)];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Stop Instances and Runtime")];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Cancel")];
+        let response: isize = msg_send![&*alert, runModal];
+        if response == 1000 {
+            Some(running.into_iter().map(|(index, _)| index).collect())
+        } else {
+            None
+        }
+    }
+}
+
+fn show_container_settings_dialog() {
+    unsafe {
+        let alert: Retained<NSAlert> = msg_send_id![NSAlert::class(), new];
+        let _: () = msg_send![&*alert, setMessageText:
+            &*NSString::from_str("Cocoa-Way Settings")];
+        let config_path = container_sessions::config_path();
+        let detail = format!(
+            "General\nLocal, open-source control plane.\n\nRuntime\nApple Container is first-class; Docker-compatible contexts are optional providers.\n\nDisplay\nProfiles may use auto, default, or a named managed display.\n\nStorage\nImage and volume operations are checked before destructive actions.\n\nAdvanced\nConfiguration file: {}",
+            config_path.display()
+        );
+        let _: () = msg_send![&*alert, setInformativeText: &*NSString::from_str(&detail)];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Open Configuration File")];
+        let _: Retained<NSObject> = msg_send_id![&*alert, addButtonWithTitle:
+            &*NSString::from_str("Done")];
+        let response: isize = msg_send![&*alert, runModal];
+        if response == 1000 {
+            let _ = Command::new("open").arg("-R").arg(config_path).spawn();
+        }
+    }
+}
+
 fn default_session_name(image: &str) -> String {
     if image.to_ascii_lowercase().contains("niri") {
         return "Niri Desktop".into();
@@ -2222,7 +3672,7 @@ fn default_session_name(image: &str) -> String {
         .next()
         .and_then(|tail| tail.split(':').next())
         .filter(|value| !value.is_empty())
-        .unwrap_or("GUI Session")
+        .unwrap_or("Application")
         .replace('-', " ")
 }
 
@@ -2307,10 +3757,26 @@ fn remember_stop_request(index: usize) {
     let sessions = container_sessions::load_sessions();
     let message = match sessions.get(index) {
         Some(session) => {
+            start_operation_task(
+                stop_task_key(index),
+                "Stop instance",
+                &session.name,
+                [
+                    "Ask application to exit",
+                    "Stop application process",
+                    "Stop Waypipe worker",
+                    "Release display",
+                    "Stop container",
+                    "Mark instance exited",
+                ],
+            );
             set_session_state(index, "Stopping", format!("Stopping {}.", session.name));
             format!("Stop requested: {}", session.name)
         }
-        None => format!("Stop requested for missing session #{}", index + 1),
+        None => format!(
+            "Stop requested for missing application profile #{}",
+            index + 1
+        ),
     };
     push_activity(message);
 }
@@ -2329,6 +3795,14 @@ declare_class!(
     }
 
     unsafe impl ContainerModeHandler {
+        #[method(windowShouldClose:)]
+        fn window_should_close(&self, window: &AnyObject) -> bool {
+            unsafe {
+                let _: () = msg_send![window, orderOut: None::<&AnyObject>];
+            }
+            false
+        }
+
         #[method(windowDidResize:)]
         fn window_did_resize(&self, _notification: &AnyObject) {
             unsafe {
@@ -2402,6 +3876,15 @@ declare_class!(
             unsafe { rebuild_window(); }
         }
 
+        #[method(forceStopContainerSession:)]
+        fn force_stop_container_session(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let index = tag.max(0) as usize;
+            push_activity(format!("Force Stop requested for application #{}", index + 1));
+            send(CompositorMessage::ForceStopContainerSession(index));
+            unsafe { rebuild_window(); }
+        }
+
         #[method(openContainerTerminal:)]
         fn open_container_terminal(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -2414,8 +3897,69 @@ declare_class!(
             unsafe { rebuild_window(); }
         }
 
+        #[method(copyApplicationDiagnostics:)]
+        fn copy_application_diagnostics(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let index = tag.max(0) as usize;
+            let sessions = container_sessions::load_sessions();
+            let Some(session) = sessions.get(index) else {
+                show_error_alert("Application profile no longer exists.");
+                return;
+            };
+            let state = session_state(index);
+            let active = active_session(index);
+            let logs = control_session_logs(index, 80);
+            let (status, detail) = state
+                .as_ref()
+                .map(|state| (session_state_label(state), state.detail.as_str()))
+                .unwrap_or(("Not checked", "No runtime status has been recorded."));
+            let active_detail = active
+                .map(|snapshot| {
+                    format!(
+                        "instance={} display={} waypipe_pid={} container_pid={}",
+                        snapshot.instance.id,
+                        snapshot.instance.display_slot,
+                        snapshot.instance.waypipe_pid,
+                        snapshot
+                            .instance
+                            .container_pid
+                            .map(|pid| pid.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    )
+                })
+                .unwrap_or_else(|| "none".into());
+            let recent_logs = if logs.is_empty() {
+                "No captured logs.".into()
+            } else {
+                logs.join("\n")
+            };
+            let diagnostics = format!(
+                "Cocoa-Way application diagnostics\n\nApplication: {}\nRuntime: {}\nImage: {}\nCommand: {}\nDisplay: {}\nPresentation: {}\nStatus: {}\nStatus detail: {}\nActive instance: {}\n\nRecent logs:\n{}",
+                session.name,
+                runtime_label(&session.runtime),
+                session.image,
+                session_display_command(session),
+                session_display_summary(session),
+                session_presentation_summary(session),
+                status,
+                detail,
+                active_detail,
+                recent_logs,
+            );
+            unsafe {
+                let pasteboard = NSPasteboard::generalPasteboard();
+                pasteboard.clearContents();
+                pasteboard.setString_forType(
+                    &NSString::from_str(&diagnostics),
+                    NSPasteboardTypeString,
+                );
+            }
+            push_activity(format!("Copied diagnostics for application: {}", session.name));
+        }
+
         #[method(reloadContainerMode:)]
         fn reload_container_mode(&self, _sender: &AnyObject) {
+            invalidate_ui_command_cache();
             request_selected_runtime_container_details();
             unsafe { rebuild_window(); }
         }
@@ -2483,6 +4027,37 @@ declare_class!(
             ));
         }
 
+        #[method(focusManagedDisplay:)]
+        fn focus_managed_display(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let display = MANAGED_DISPLAY_ACTIONS
+                .lock()
+                .unwrap()
+                .get(tag.max(0) as usize)
+                .cloned();
+            let Some(display) = display else {
+                show_error_alert("Managed display no longer exists.");
+                return;
+            };
+            let application = unsafe {
+                NSRunningApplication::runningApplicationWithProcessIdentifier(
+                    display.pid as libc::pid_t,
+                )
+            };
+            let Some(application) = application else {
+                show_error_alert("The managed display process is no longer running.");
+                return;
+            };
+            let activated = unsafe {
+                application.activateWithOptions(
+                    NSApplicationActivationOptions::NSApplicationActivateAllWindows,
+                )
+            };
+            if !activated {
+                show_error_alert("macOS could not focus the managed display window.");
+            }
+        }
+
         #[method(closeManagedDisplay:)]
         fn close_managed_display(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -2496,8 +4071,30 @@ declare_class!(
                 return;
             };
             if confirm_close_managed_display(&display.slot) {
+                CLOSING_MANAGED_DISPLAYS
+                    .lock()
+                    .unwrap()
+                    .push(display.slot.clone());
                 send(CompositorMessage::CloseManagedDisplay(display.slot));
+                unsafe { rebuild_window(); }
             }
+        }
+
+        #[method(releaseDisplayAttachment:)]
+        fn release_display_attachment(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let index = tag.max(0) as usize;
+            if !session_can_stop(session_state(index).as_ref()) {
+                push_activity(format!(
+                    "Display release ignored: application #{} is not running.",
+                    index + 1
+                ));
+                unsafe { rebuild_window(); }
+                return;
+            }
+            remember_stop_request(index);
+            send(CompositorMessage::StopContainerSession(index));
+            unsafe { rebuild_window(); }
         }
 
         #[method(clearContainerActivity:)]
@@ -2516,6 +4113,11 @@ declare_class!(
                 .spawn();
         }
 
+        #[method(openContainerSettings:)]
+        fn open_container_settings(&self, _sender: &AnyObject) {
+            show_container_settings_dialog();
+        }
+
         #[method(addContainerSession:)]
         fn add_container_session(&self, _sender: &AnyObject) {
             unsafe { show_add_session_dialog(); }
@@ -2527,10 +4129,67 @@ declare_class!(
             unsafe { show_edit_session_dialog(tag.max(0) as usize); }
         }
 
+        #[method(changeContainerSessionPresentation:)]
+        fn change_container_session_presentation(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let index = tag.max(0) as usize;
+            if active_session(index).is_some() {
+                show_error_alert("Stop this application before changing its presentation mode.");
+                unsafe { rebuild_window(); }
+                return;
+            }
+            let selected: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
+            let sessions = container_sessions::load_sessions();
+            let Some(mut session) = sessions.get(index).cloned() else {
+                show_error_alert("Application profile no longer exists.");
+                unsafe { rebuild_window(); }
+                return;
+            };
+            let presentation = if selected == 1 { "rootless" } else { "desktop" };
+            session.presentation = Some(presentation.into());
+            match container_sessions::replace_session(index, &session) {
+                Ok(()) => {
+                    invalidate_profile_validation(index);
+                    push_activity(format!(
+                        "{} presentation changed to {}.",
+                        session.name,
+                        session_presentation_summary(&session)
+                    ));
+                }
+                Err(error) => {
+                    let message = format!("Failed to update presentation mode: {}", error);
+                    push_activity(message.clone());
+                    show_error_alert(&message);
+                }
+            }
+            unsafe { rebuild_window(); }
+        }
+
         #[method(duplicateContainerSession:)]
         fn duplicate_container_session(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             unsafe { duplicate_session_profile(tag.max(0) as usize); }
+        }
+
+        #[method(applicationProfileMoreAction:)]
+        fn application_profile_more_action(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let selected: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
+            let index = tag.max(0) as usize;
+            match selected {
+                1 => unsafe { duplicate_session_profile(index) },
+                2 => unsafe { export_session_profile(index) },
+                3 => unsafe { show_raw_session_profile(index) },
+                4 => unsafe { delete_container_session(index) },
+                _ => {}
+            }
+            unsafe { rebuild_window(); }
+        }
+
+        #[method(viewRawContainerSession:)]
+        fn view_raw_container_session(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            unsafe { show_raw_session_profile(tag.max(0) as usize); }
         }
 
         #[method(newImageContainerSession:)]
@@ -2582,10 +4241,18 @@ declare_class!(
 
         #[method(stopAppleContainerSystem:)]
         fn stop_apple_container_system(&self, _sender: &AnyObject) {
+            let Some(running_profiles) = confirm_stop_apple_runtime() else {
+                return;
+            };
+            for index in running_profiles {
+                remember_stop_request(index);
+                send(CompositorMessage::ForceStopContainerSession(index));
+            }
             send(CompositorMessage::RuntimeSystemAction {
                 runtime: "apple".into(),
                 action: "stop".into(),
             });
+            unsafe { rebuild_window(); }
         }
 
         #[method(pullContainerSessionImage:)]
@@ -2594,7 +4261,7 @@ declare_class!(
             let index = tag.max(0) as usize;
             let sessions = container_sessions::load_sessions();
             let Some(session) = sessions.get(index) else {
-                show_error_alert("Session no longer exists.");
+                show_error_alert("Application profile no longer exists.");
                 return;
             };
             *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
@@ -2673,14 +4340,45 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, image)) = action else {
+            let Some(action) = action else {
                 show_error_alert("Image action no longer exists. Press Reload and try again.");
                 return;
             };
-            if !confirm_delete_resource("Image", &runtime, &image) {
+            if !confirm_image_removal(&action, false) {
                 return;
             }
-            send(CompositorMessage::DeleteContainerImage { runtime, image });
+            send(CompositorMessage::DeleteContainerImage {
+                runtime: action.runtime,
+                image: action.reference,
+            });
+        }
+
+        #[method(imageMoreAction:)]
+        fn image_more_action(&self, sender: &AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let selected: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
+            let action = IMAGE_DELETE_ACTIONS
+                .lock()
+                .unwrap()
+                .get(tag.max(0) as usize)
+                .cloned();
+            let Some(mut action) = action else {
+                show_error_alert("Image action no longer exists. Press Reload and try again.");
+                return;
+            };
+            let remove_tag = selected == 1 && image_reference_has_tag(&action.reference);
+            if selected == 0 || !confirm_image_removal(&action, remove_tag) {
+                return;
+            }
+            if !remove_tag {
+                if let Some(image_id) = action.image_id.take() {
+                    action.reference = image_id;
+                }
+            }
+            send(CompositorMessage::DeleteContainerImage {
+                runtime: action.runtime,
+                image: action.reference,
+            });
         }
 
         #[method(deleteLocalContainerVolume:)]
@@ -2691,14 +4389,17 @@ declare_class!(
                 .unwrap()
                 .get(tag.max(0) as usize)
                 .cloned();
-            let Some((runtime, volume)) = action else {
+            let Some(action) = action else {
                 show_error_alert("Volume action no longer exists. Press Reload and try again.");
                 return;
             };
-            if !confirm_delete_resource("Volume", &runtime, &volume) {
+            if !confirm_volume_removal(&action) {
                 return;
             }
-            send(CompositorMessage::DeleteContainerVolume { runtime, volume });
+            send(CompositorMessage::DeleteContainerVolume {
+                runtime: action.runtime,
+                volume: action.name,
+            });
         }
 
         #[method(stopRuntimeContainer:)]
@@ -2823,6 +4524,42 @@ declare_class!(
             });
         }
 
+        #[method(startOrbStackMachine:)]
+        fn start_orbstack_machine(&self, sender: &AnyObject) {
+            send_orbstack_machine_action(sender, "start");
+        }
+
+        #[method(stopOrbStackMachine:)]
+        fn stop_orbstack_machine(&self, sender: &AnyObject) {
+            send_orbstack_machine_action(sender, "stop");
+        }
+
+        #[method(deleteOrbStackMachine:)]
+        fn delete_orbstack_machine(&self, sender: &AnyObject) {
+            let Some(name) = orbstack_machine_action_name(sender) else {
+                return;
+            };
+            if !confirm_delete_resource("Machine", "OrbStack", &name) {
+                return;
+            }
+            send(CompositorMessage::RuntimeMachineAction {
+                runtime: "orbstack".into(),
+                name,
+                action: "delete".into(),
+            });
+        }
+
+        #[method(openOrbStackMachineTerminal:)]
+        fn open_orbstack_machine_terminal(&self, sender: &AnyObject) {
+            let Some(name) = orbstack_machine_action_name(sender) else {
+                return;
+            };
+            send(CompositorMessage::OpenRuntimeMachineTerminal {
+                runtime: "orbstack".into(),
+                name,
+            });
+        }
+
         #[method(useDockerContext:)]
         fn use_docker_context(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -2921,7 +4658,7 @@ declare_class!(
             let tag: isize = unsafe { msg_send![sender, tag] };
             let selected = tag.max(0) as usize;
             *SELECTED_NAV.lock().unwrap() = selected;
-            if selected != NAV_SESSIONS {
+            if !matches!(selected, NAV_SESSIONS | NAV_RUNNING) {
                 *SELECTED_SESSION.lock().unwrap() = None;
             }
             if selected != NAV_IMAGES {
@@ -2952,7 +4689,9 @@ declare_class!(
         #[method(selectContainerSession:)]
         fn select_container_session(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
-            *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
+            if *SELECTED_NAV.lock().unwrap() != NAV_RUNNING {
+                *SELECTED_NAV.lock().unwrap() = NAV_SESSIONS;
+            }
             *SELECTED_SESSION.lock().unwrap() = Some(tag.max(0) as usize);
             *SELECTED_IMAGE.lock().unwrap() = None;
             *SELECTED_VOLUME.lock().unwrap() = None;
@@ -2986,7 +4725,6 @@ unsafe fn rebuild_window() {
     unsafe {
         install_content(window, mtm);
     }
-    window.makeKeyAndOrderFront(None);
 }
 
 unsafe fn refresh_window_without_focus() {
@@ -3046,6 +4784,12 @@ unsafe fn ensure_window(mtm: MainThreadMarker) -> &'static NSWindow {
 }
 
 unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
+    unsafe {
+        capture_tracked_scroll_position(&LIST_SCROLL_VIEW);
+        capture_tracked_scroll_position(&DETAIL_SCROLL_VIEW);
+    }
+    *SUMMARY_FPS_LABEL.lock().unwrap() = None;
+    LIVE_DISPLAY_FPS_LABELS.lock().unwrap().clear();
     let (width, height) = content_size(window);
     let root: Retained<NSView> = unsafe {
         msg_send_id![mtm.alloc::<NSView>(), initWithFrame: rect(0.0, 0.0, width, height)]
@@ -3053,6 +4797,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
     let load_report = container_sessions::load_sessions_report();
     let sessions = load_report.sessions;
     let config_error = load_report.error;
+    schedule_automatic_profile_validation(&sessions);
     let handler = unsafe { ensure_handler() };
     let selected_nav = *SELECTED_NAV.lock().unwrap();
     let selected_tab = *SELECTED_TAB.lock().unwrap();
@@ -3060,21 +4805,28 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
 
     let sidebar_w = 230.0;
     let available_w = (width - sidebar_w).max(760.0);
-    let mut list_w = if matches!(selected_nav, NAV_IMAGES | NAV_VOLUMES | NAV_DISPLAYS) {
+    let runtime_overview_page = matches!(
+        selected_nav,
+        NAV_APPLE_CONTAINER | NAV_DOCKER | NAV_ORBSTACK
+    );
+    let mut list_w = if runtime_overview_page {
+        width - sidebar_w
+    } else if matches!(selected_nav, NAV_IMAGES | NAV_VOLUMES | NAV_DISPLAYS) {
         (available_w * 0.46).clamp(440.0, 560.0)
     } else {
         (available_w * 0.39).clamp(380.0, 470.0)
     };
     let min_detail_w = 420.0;
-    if width - sidebar_w - list_w < min_detail_w {
+    if !runtime_overview_page && width - sidebar_w - list_w < min_detail_w {
         list_w = (width - sidebar_w - min_detail_w).max(360.0);
     }
     let toolbar_h = 64.0;
     let detail_x = sidebar_w + list_w;
     let detail_w = width - detail_x;
 
+    let sidebar = add_sidebar_background(&root, sidebar_w, height, mtm);
     add_resource_sidebar(
-        &root,
+        &sidebar,
         sessions.len(),
         height,
         sidebar_w,
@@ -3095,29 +4847,42 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         mtm,
     );
     add_separator(&root, rect(sidebar_w, height - toolbar_h, list_w, 1.0), mtm);
-    add_separator(&root, rect(detail_x, 0.0, 1.0, height), mtm);
+    if !runtime_overview_page {
+        add_separator(&root, rect(detail_x, 0.0, 1.0, height), mtm);
+    }
 
-    let scroll_frame = rect(sidebar_w + 1.0, 0.0, list_w - 1.0, height - toolbar_h);
+    let overview_summary_height = if runtime_overview_page { 72.0 } else { 0.0 };
+    let scroll_frame = rect(
+        sidebar_w + 1.0,
+        overview_summary_height,
+        list_w - 1.0,
+        height - toolbar_h - overview_summary_height,
+    );
     let scroll = unsafe { NSScrollView::initWithFrame(mtm.alloc::<NSScrollView>(), scroll_frame) };
     unsafe {
         scroll.setHasVerticalScroller(true);
         scroll.setHasHorizontalScroller(false);
     }
 
-    let row_height = 142.0;
+    let row_height = 180.0;
     let content_w = list_w - 16.0;
     let min_page_height = match selected_nav {
-        NAV_APPLE_CONTAINER => 1660.0,
-        NAV_ORBSTACK => 1320.0,
-        NAV_DOCKER => 1240.0,
+        NAV_APPLE_CONTAINER => 1860.0,
+        NAV_ORBSTACK => 1520.0,
+        NAV_DOCKER => 1760.0,
         NAV_IMAGES => 1800.0,
         NAV_VOLUMES => 1400.0,
         NAV_DISPLAYS => {
             let managed_rows =
                 managed_displays_snapshot().len() + pending_managed_displays_snapshot().len();
-            1180.0 + managed_rows as f64 * 126.0
+            let active_rows = active_sessions_snapshot().len();
+            780.0
+                + managed_rows as f64 * 150.0
+                + active_rows.max(1) as f64 * 116.0
+                + sessions.len().max(1).min(16) as f64 * 78.0
         }
-        NAV_ACTIVITY | NAV_COMMANDS => 1080.0,
+        NAV_ACTIVITY => 1560.0,
+        NAV_COMMANDS => 1080.0,
         _ => height - toolbar_h,
     };
     let content_height = (sessions.len().max(1) as f64 * row_height + 18.0).max(min_page_height);
@@ -3147,7 +4912,7 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         add_activity_list(&content, content_w, content_height, mtm);
     } else if selected_nav == NAV_COMMANDS {
         add_commands_list(&content, content_w, content_height, handler, mtm);
-    } else if selected_nav != NAV_SESSIONS {
+    } else if !matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
         add_placeholder_list(
             &content,
             content_w,
@@ -3157,11 +4922,18 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         );
     } else if let Some(error) = config_error.as_deref() {
         add_config_error_list(&content, content_w, content_height, error, handler, mtm);
+    } else if selected_nav == NAV_RUNNING && active_sessions_snapshot().is_empty() {
+        add_running_empty_list(&content, content_w, content_height, mtm);
     } else if sessions.is_empty() {
         add_session_empty_list(&content, content_w, content_height, handler, mtm);
     } else {
-        for (index, session) in sessions.iter().enumerate() {
-            let y = content_height - ((index + 1) as f64 * row_height);
+        let visible_sessions = sessions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| selected_nav == NAV_SESSIONS || active_session(*index).is_some())
+            .collect::<Vec<_>>();
+        for (row, (index, session)) in visible_sessions.into_iter().enumerate() {
+            let y = content_height - ((row + 1) as f64 * row_height);
             unsafe {
                 add_session_row(
                     &content,
@@ -3182,35 +4954,85 @@ unsafe fn install_content(window: &NSWindow, mtm: MainThreadMarker) {
         scroll.setDocumentView(Some(&content));
         let clip_view: Retained<AnyObject> = msg_send_id![&*scroll, contentView];
         let top_y = (content_height - scroll_frame.size.height).max(0.0);
-        let _: () = msg_send![&*clip_view, scrollToPoint: NSPoint { x: 0.0, y: top_y }];
+        let scroll_key = format!("list:{selected_nav}");
+        let saved_y = saved_scroll_position(&scroll_key, top_y).clamp(0.0, top_y);
+        let _: () = msg_send![&*clip_view, scrollToPoint: NSPoint { x: 0.0, y: saved_y }];
         let _: () = msg_send![&*scroll, reflectScrolledClipView: &*clip_view];
+        *LIST_SCROLL_VIEW.lock().unwrap() = Some(TrackedScrollView {
+            pointer: (&*scroll as *const NSScrollView) as usize,
+            key: scroll_key,
+        });
     }
     unsafe {
         root.addSubview(&scroll);
     }
-    add_detail_panel(
-        &root,
-        detail_x,
-        0.0,
-        detail_w,
-        height,
-        selected_tab,
-        selected_nav,
-        selected_session.and_then(|index| sessions.get(index).map(|session| (index, session))),
-        handler,
-        mtm,
-    );
+    if runtime_overview_page {
+        *DETAIL_SCROLL_VIEW.lock().unwrap() = None;
+        add_separator(
+            &root,
+            rect(sidebar_w, overview_summary_height, list_w, 1.0),
+            mtm,
+        );
+        add_runtime_summary(&root, sidebar_w + 28.0, 4.0, list_w - 56.0, mtm);
+    } else {
+        add_detail_panel(
+            &root,
+            detail_x,
+            0.0,
+            detail_w,
+            height,
+            selected_tab,
+            selected_nav,
+            selected_session.and_then(|index| sessions.get(index).map(|session| (index, session))),
+            detail_scroll_key(selected_nav, selected_tab, selected_session),
+            handler,
+            mtm,
+        );
+    }
     window.setContentView(Some(&root));
 }
 
+fn add_sidebar_background(
+    parent: &NSView,
+    width: f64,
+    height: f64,
+    mtm: MainThreadMarker,
+) -> Retained<NSView> {
+    let frame = rect(0.0, 0.0, width, height);
+    let content: Retained<NSView> =
+        unsafe { msg_send_id![mtm.alloc::<NSView>(), initWithFrame: frame] };
+
+    if let Some(glass_class) = AnyClass::get("NSGlassEffectView") {
+        let glass: Allocated<NSView> = unsafe { msg_send_id![glass_class, alloc] };
+        let glass: Retained<NSView> = unsafe { msg_send_id![glass, initWithFrame: frame] };
+        unsafe {
+            let _: () = msg_send![&*glass, setStyle: 0isize];
+            let _: () = msg_send![&*glass, setCornerRadius: 0.0f64];
+            let _: () = msg_send![&*glass, setContentView: &*content];
+            parent.addSubview(&glass);
+        }
+    } else {
+        unsafe {
+            parent.addSubview(&content);
+        }
+    }
+
+    content
+}
+
 fn selected_session_index(session_count: usize, selected_nav: usize) -> Option<usize> {
-    if selected_nav != NAV_SESSIONS {
+    if !matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
         return None;
     }
 
     let mut selected = SELECTED_SESSION.lock().unwrap();
     match *selected {
-        Some(index) if index < session_count => Some(index),
+        Some(index)
+            if index < session_count
+                && (selected_nav != NAV_RUNNING || active_session(index).is_some()) =>
+        {
+            Some(index)
+        }
         _ => {
             *selected = None;
             None
@@ -3236,32 +5058,42 @@ fn add_resource_sidebar(
     mtm: MainThreadMarker,
 ) {
     let compact = height < 700.0;
-    let nav_height = if compact { 34.0 } else { 44.0 };
+    let nav_height = if compact { 32.0 } else { 44.0 };
     let session_y = if compact {
         height - 132.0
     } else {
         height - 144.0
     };
-    let nav_step = if compact { 38.0 } else { 48.0 };
-    let runtime_heading_y = if compact {
-        height - 286.0
+    let nav_step = if compact { 34.0 } else { 46.0 };
+    let resources_heading_y = if compact {
+        height - 194.0
     } else {
-        height - 340.0
+        height - 230.0
     };
-    let runtime_first_y = if compact {
+    let resources_first_y = if compact {
+        height - 228.0
+    } else {
+        height - 272.0
+    };
+    let runtime_heading_y = if compact {
         height - 324.0
     } else {
-        height - 388.0
+        height - 410.0
+    };
+    let runtime_first_y = if compact {
+        height - 358.0
+    } else {
+        height - 454.0
     };
     let general_heading_y = if compact {
-        height - 440.0
+        height - 426.0
     } else {
-        height - 536.0
+        height - 548.0
     };
     let general_first_y = if compact {
-        height - 478.0
+        height - 460.0
     } else {
-        height - 584.0
+        height - 592.0
     };
     add_label(
         parent,
@@ -3272,7 +5104,7 @@ fn add_resource_sidebar(
     );
     add_label(
         parent,
-        "Container GUI",
+        "Applications",
         rect(18.0, height - 96.0, width - 36.0, 18.0),
         mtm,
         TextStyle::Section,
@@ -3280,10 +5112,27 @@ fn add_resource_sidebar(
     add_nav_item(
         parent,
         NAV_SESSIONS,
-        "GUI Sessions",
+        "Applications",
         &format!("{} profiles", session_count),
         selected_nav == NAV_SESSIONS,
         rect(10.0, session_y, width - 20.0, nav_height),
+        handler,
+        mtm,
+    );
+    add_label(
+        parent,
+        "Resources",
+        rect(18.0, resources_heading_y, width - 36.0, 18.0),
+        mtm,
+        TextStyle::Section,
+    );
+    add_nav_item(
+        parent,
+        NAV_RUNNING,
+        "Running",
+        &format!("{} active", active_sessions_snapshot().len()),
+        selected_nav == NAV_RUNNING,
+        rect(10.0, session_y - nav_step, width - 20.0, nav_height),
         handler,
         mtm,
     );
@@ -3293,7 +5142,7 @@ fn add_resource_sidebar(
         "Images",
         "GUI-ready images",
         selected_nav == NAV_IMAGES,
-        rect(10.0, session_y - nav_step, width - 20.0, nav_height),
+        rect(10.0, resources_first_y, width - 20.0, nav_height),
         handler,
         mtm,
     );
@@ -3303,7 +5152,7 @@ fn add_resource_sidebar(
         "Volumes",
         "shared data",
         selected_nav == NAV_VOLUMES,
-        rect(10.0, session_y - nav_step * 2.0, width - 20.0, nav_height),
+        rect(10.0, resources_first_y - nav_step, width - 20.0, nav_height),
         handler,
         mtm,
     );
@@ -3313,14 +5162,19 @@ fn add_resource_sidebar(
         "Displays",
         "window slots",
         selected_nav == NAV_DISPLAYS,
-        rect(10.0, session_y - nav_step * 3.0, width - 20.0, nav_height),
+        rect(
+            10.0,
+            resources_first_y - nav_step * 2.0,
+            width - 20.0,
+            nav_height,
+        ),
         handler,
         mtm,
     );
 
     add_label(
         parent,
-        "Runtime",
+        "Runtimes",
         rect(18.0, runtime_heading_y, width - 36.0, 18.0),
         mtm,
         TextStyle::Section,
@@ -3338,42 +5192,32 @@ fn add_resource_sidebar(
     add_nav_item(
         parent,
         NAV_DOCKER,
-        "Docker",
-        "compatibility",
+        "Docker-compatible",
+        "contexts and providers",
         selected_nav == NAV_DOCKER,
         rect(10.0, runtime_first_y - nav_step, width - 20.0, nav_height),
         handler,
         mtm,
     );
-    add_nav_item(
-        parent,
-        NAV_ORBSTACK,
-        "OrbStack",
-        "classic bridge",
-        selected_nav == NAV_ORBSTACK,
-        rect(
-            10.0,
-            runtime_first_y - nav_step * 2.0,
-            width - 20.0,
-            nav_height,
-        ),
-        handler,
-        mtm,
-    );
-
     add_label(
         parent,
-        "General",
+        "Diagnostics",
         rect(18.0, general_heading_y, width - 36.0, 18.0),
         mtm,
         TextStyle::Section,
     );
     let activity_count = activity_snapshot().len();
+    let running_tasks = active_task_count();
+    let activity_subtitle = if running_tasks > 0 {
+        format!("{} running · {} events", running_tasks, activity_count)
+    } else {
+        format!("{} events", activity_count)
+    };
     add_nav_item(
         parent,
         NAV_ACTIVITY,
         "Activity",
-        &format!("{} events", activity_count),
+        &activity_subtitle,
         selected_nav == NAV_ACTIVITY,
         rect(10.0, general_first_y, width - 20.0, nav_height),
         handler,
@@ -3390,13 +5234,18 @@ fn add_resource_sidebar(
         mtm,
     );
     add_separator(parent, rect(0.0, 70.0, width, 1.0), mtm);
-    add_label(
+    let settings = add_button(
         parent,
-        "Open source\nLocal control plane",
-        rect(18.0, 22.0, width - 36.0, 38.0),
+        "Settings...",
+        rect(18.0, 24.0, 104.0, 28.0),
+        handler,
+        sel!(openContainerSettings:),
         mtm,
-        TextStyle::Caption,
     );
+    unsafe {
+        let _: () = msg_send![&*settings, setToolTip:
+            &*NSString::from_str("Open Cocoa-Way Container Mode settings")];
+    }
 }
 
 fn add_nav_item(
@@ -3482,17 +5331,24 @@ fn add_list_toolbar(
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
+    let title_width = if selected_nav == NAV_SESSIONS {
+        (width - 238.0).max(126.0)
+    } else if selected_nav == NAV_ACTIVITY {
+        (width - 190.0).max(110.0)
+    } else {
+        (width - 116.0).max(110.0)
+    };
     add_label(
         parent,
         nav_title(selected_nav),
-        rect(x + 18.0, y + 18.0, width - 160.0, 30.0),
+        rect(x + 18.0, y + 18.0, title_width, 30.0),
         mtm,
         TextStyle::Title,
     );
     let reload = add_button(
         parent,
         "Reload",
-        rect(x + width - 132.0, y + 17.0, 72.0, 30.0),
+        rect(x + width - 86.0, y + 17.0, 68.0, 30.0),
         handler,
         sel!(reloadContainerMode:),
         mtm,
@@ -3505,7 +5361,7 @@ fn add_list_toolbar(
         let clear = add_button(
             parent,
             "Clear",
-            rect(x + width - 214.0, y + 17.0, 74.0, 30.0),
+            rect(x + width - 168.0, y + 17.0, 74.0, 30.0),
             handler,
             sel!(clearContainerActivity:),
             mtm,
@@ -3518,15 +5374,15 @@ fn add_list_toolbar(
     if selected_nav == NAV_SESSIONS {
         let open = add_button(
             parent,
-            "+",
-            rect(x + width - 44.0, y + 17.0, 34.0, 30.0),
+            "New Application",
+            rect(x + width - 212.0, y + 17.0, 116.0, 30.0),
             handler,
             sel!(addContainerSession:),
             mtm,
         );
         unsafe {
             let _: () = msg_send![&*open, setToolTip:
-                &*NSString::from_str("Add a Container Mode GUI session")];
+                &*NSString::from_str("Create a saved application profile")];
         }
     }
     let _ = height;
@@ -3542,14 +5398,14 @@ fn add_session_empty_list(
     let center_y = (content_height * 0.52).max(250.0);
     add_label(
         parent,
-        "No GUI Sessions",
+        "No Applications",
         rect(34.0, center_y, width - 68.0, 34.0),
         mtm,
         TextStyle::Title,
     );
     add_label(
         parent,
-        "Restore the bundled Niri desktop profile or create a custom container GUI session.",
+        "Restore the bundled Niri desktop profile or create a custom Wayland application profile.",
         rect(34.0, center_y - 42.0, width - 68.0, 42.0),
         mtm,
         TextStyle::Body,
@@ -3579,10 +5435,28 @@ fn add_session_empty_list(
     );
     unsafe {
         let _: () = msg_send![&*restore, setToolTip:
-            &*NSString::from_str("Restore the bundled example GUI session")];
+            &*NSString::from_str("Restore the bundled example application profile")];
         let _: () = msg_send![&*add, setToolTip:
-            &*NSString::from_str("Create a custom Container Mode GUI session")];
+            &*NSString::from_str("Create a custom Container Mode application")];
     }
+}
+
+fn add_running_empty_list(parent: &NSView, width: f64, content_height: f64, mtm: MainThreadMarker) {
+    let center_y = (content_height * 0.52).max(250.0);
+    add_label(
+        parent,
+        "No Running Applications",
+        rect(34.0, center_y, width - 68.0, 34.0),
+        mtm,
+        TextStyle::Title,
+    );
+    add_label(
+        parent,
+        "Launch an application profile to create an instance. Active containers, Waypipe workers, and display attachments will appear here.",
+        rect(34.0, center_y - 62.0, width - 68.0, 54.0),
+        mtm,
+        TextStyle::Body,
+    );
 }
 
 fn add_config_error_list(
@@ -3631,6 +5505,7 @@ fn add_config_error_list(
 
 fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: MainThreadMarker) {
     let activity = activity_snapshot();
+    let tasks = operation_tasks_snapshot();
     let mut y = content_height - 58.0;
     add_label(
         parent,
@@ -3681,7 +5556,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     } else {
         add_label(
             parent,
-            "No performance sample yet. Launch a GUI session or wait for the next render tick.",
+            "No performance sample yet. Launch an application or wait for the next render tick.",
             rect(38.0, y - 8.0, width - 76.0, 36.0),
             mtm,
             TextStyle::Caption,
@@ -3729,7 +5604,7 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
     add_label(
         parent,
         &format!(
-            "Disk {}",
+            "Apple Container storage: {}",
             resources
                 .disk_available_bytes
                 .map(|bytes| format!("{:.1} GiB free", crate::diagnostics::bytes_to_gib(bytes)))
@@ -3740,6 +5615,73 @@ fn add_activity_list(parent: &NSView, width: f64, content_height: f64, mtm: Main
         TextStyle::Caption,
     );
     y -= 236.0;
+
+    if !tasks.is_empty() {
+        add_label(
+            parent,
+            "Operations",
+            rect(34.0, y, width - 68.0, 24.0),
+            mtm,
+            TextStyle::Title,
+        );
+        y -= 40.0;
+        for task in tasks.iter().rev().take(4) {
+            let completed = task
+                .steps
+                .iter()
+                .filter(|step| step.status == TaskStepStatus::Completed)
+                .count();
+            let current = task
+                .steps
+                .iter()
+                .find(|step| {
+                    matches!(
+                        step.status,
+                        TaskStepStatus::Running | TaskStepStatus::Failed
+                    )
+                })
+                .map(|step| step.name.as_str())
+                .unwrap_or_else(|| {
+                    if task.status == TaskStatus::Completed {
+                        "Complete"
+                    } else {
+                        "Queued"
+                    }
+                });
+            add_card(parent, rect(24.0, y - 66.0, width - 48.0, 84.0), mtm);
+            add_label(
+                parent,
+                &format!("{} · {}", task.operation, task.subject),
+                rect(38.0, y - 2.0, width - 76.0, 20.0),
+                mtm,
+                TextStyle::Heading,
+            );
+            add_label(
+                parent,
+                &format!(
+                    "{} · {}/{} steps · {}",
+                    task.status.label(),
+                    completed,
+                    task.steps.len(),
+                    current
+                ),
+                rect(38.0, y - 28.0, width - 76.0, 18.0),
+                mtm,
+                TextStyle::Caption,
+            );
+            if let Some(detail) = task.detail.as_deref() {
+                add_label(
+                    parent,
+                    detail,
+                    rect(38.0, y - 52.0, width - 76.0, 18.0),
+                    mtm,
+                    TextStyle::Caption,
+                );
+            }
+            y -= 98.0;
+        }
+        y -= 16.0;
+    }
 
     if activity.is_empty() {
         add_label(
@@ -3820,7 +5762,6 @@ fn add_images_list(
     );
     let button_area = width - 76.0;
     let half = ((button_area - 10.0) / 2.0).max(80.0);
-    let third = ((button_area - 20.0) / 3.0).max(64.0);
     let pull = add_button(
         parent,
         "Pull from Source...",
@@ -3837,33 +5778,23 @@ fn add_images_list(
         sel!(loginContainerRegistry:),
         mtm,
     );
-    let add_session = add_button(
-        parent,
-        "New Session...",
-        rect(38.0, y - 114.0, third, 28.0),
-        handler,
-        sel!(newImageContainerSession:),
-        mtm,
-    );
     let build = add_button(
         parent,
         "Build Example",
-        rect(48.0 + third, y - 114.0, third, 28.0),
+        rect(38.0, y - 114.0, half, 28.0),
         handler,
         sel!(buildSmokeContainerImage:),
         mtm,
     );
     let load = add_button(
         parent,
-        "Load OCI",
-        rect(58.0 + third * 2.0, y - 114.0, third, 28.0),
+        "Import OCI Archive...",
+        rect(48.0 + half, y - 114.0, half, 28.0),
         handler,
         sel!(loadContainerImage:),
         mtm,
     );
     unsafe {
-        let _: () = msg_send![&*add_session, setToolTip:
-            &*NSString::from_str("Create a GUI session with sensible image defaults")];
         let _: () = msg_send![&*build, setToolTip:
             &*NSString::from_str("Build the bundled example image with Apple Container")];
         let _: () = msg_send![&*pull, setToolTip:
@@ -3943,8 +5874,8 @@ fn add_images_list(
                 };
                 let create = add_button(
                     parent,
-                    "Add Session",
-                    rect(38.0, y - 24.0, 112.0, 28.0),
+                    "Create Application",
+                    rect(38.0, y - 24.0, 142.0, 28.0),
                     handler,
                     sel!(createContainerSessionFromImage:),
                     mtm,
@@ -3952,26 +5883,36 @@ fn add_images_list(
                 unsafe {
                     let _: () = msg_send![&*create, setTag: create_index as isize];
                     let _: () = msg_send![&*create, setToolTip:
-                        &*NSString::from_str("Create a GUI session from this image")];
+                        &*NSString::from_str("Create an application profile from this image")];
                 }
                 let delete_index = {
                     let mut actions = IMAGE_DELETE_ACTIONS.lock().unwrap();
                     let action_index = actions.len();
-                    actions.push((inventory.runtime_key.to_string(), reference.clone()));
+                    actions.push(ImageDeleteAction {
+                        runtime: inventory.runtime_key.to_string(),
+                        reference: reference.clone(),
+                        image_id: image_id_from_label(&row.label, reference),
+                    });
                     action_index
                 };
-                let delete = add_button(
+                let image_has_tag = image_reference_has_tag(reference);
+                let more = add_popup(
                     parent,
-                    "Delete",
-                    rect(160.0, y - 24.0, 78.0, 28.0),
-                    handler,
-                    sel!(deleteLocalContainerImage:),
+                    rect(190.0, y - 24.0, 112.0, 28.0),
+                    if image_has_tag {
+                        &["More…", "Remove Tag", "Delete Image"]
+                    } else {
+                        &["More…", "Delete Image"]
+                    },
+                    0,
                     mtm,
                 );
                 unsafe {
-                    let _: () = msg_send![&*delete, setTag: delete_index as isize];
-                    let _: () = msg_send![&*delete, setToolTip:
-                        &*NSString::from_str("Delete this local image after confirmation")];
+                    let _: () = msg_send![&*more, setTarget: handler];
+                    let _: () = msg_send![&*more, setAction: sel!(imageMoreAction:)];
+                    let _: () = msg_send![&*more, setTag: delete_index as isize];
+                    let _: () = msg_send![&*more, setToolTip:
+                        &*NSString::from_str("Remove a tag or delete the underlying image after dependency checks")];
                 }
             }
             y -= 86.0;
@@ -3997,7 +5938,7 @@ fn add_images_list(
     );
     add_label(
         parent,
-        "Destructive action. It is separate from the normal Add Session path.",
+        "Destructive image cleanup is separate from creating an application profile.",
         rect(38.0, y - 10.0, width - 76.0, 18.0),
         mtm,
         TextStyle::Caption,
@@ -4078,33 +6019,88 @@ fn add_volumes_list(
 
         for row in inventory.rows.iter().take(10) {
             if row.name.is_none() {
-                add_label(
-                    parent,
-                    &row.label,
-                    rect(38.0, y + 4.0, width - 76.0, 18.0),
-                    mtm,
-                    TextStyle::Caption,
-                );
-                y -= 40.0;
+                if row.label.starts_with("No ") {
+                    add_card(parent, rect(24.0, y - 84.0, width - 48.0, 116.0), mtm);
+                    add_label(
+                        parent,
+                        &row.label,
+                        rect(38.0, y + 8.0, width - 76.0, 20.0),
+                        mtm,
+                        TextStyle::Heading,
+                    );
+                    add_label(
+                        parent,
+                        "Volumes preserve application data between launches.",
+                        rect(38.0, y - 20.0, width - 76.0, 20.0),
+                        mtm,
+                        TextStyle::Caption,
+                    );
+                    add_button(
+                        parent,
+                        "Create Volume",
+                        rect(38.0, y - 62.0, 116.0, 28.0),
+                        handler,
+                        sel!(createContainerVolume:),
+                        mtm,
+                    );
+                    y -= 136.0;
+                } else {
+                    add_label(
+                        parent,
+                        &row.label,
+                        rect(38.0, y + 4.0, width - 76.0, 36.0),
+                        mtm,
+                        TextStyle::Caption,
+                    );
+                    y -= 52.0;
+                }
                 continue;
             }
-            let selected = selected_volume
-                .as_ref()
-                .is_some_and(|selected| selected.name == row.name.clone().unwrap_or_default());
-            add_card(parent, rect(24.0, y - 42.0, width - 48.0, 76.0), mtm);
+            let selected = selected_volume.as_ref().is_some_and(|selected| {
+                selected.name == row.name.clone().unwrap_or_default()
+                    && selected.runtime_key == inventory.runtime_key
+            });
+            add_card(parent, rect(24.0, y - 62.0, width - 48.0, 96.0), mtm);
             if selected {
-                add_separator(parent, rect(24.0, y - 42.0, 4.0, 76.0), mtm);
+                add_separator(parent, rect(24.0, y - 62.0, 4.0, 96.0), mtm);
             }
+            let name = row.name.as_ref().unwrap();
+            let usage = volume_usage(inventory.runtime_key, name);
+            let metadata = volume_inspect_metadata(inventory.runtime_key, name, &row.label);
+            let usage_summary = if usage.loading {
+                "Checking profile and container usage...".into()
+            } else if let Some(error) = usage.error.as_deref() {
+                short_text(error, 56)
+            } else {
+                format!(
+                    "{} referenced · {} mounted",
+                    usage.referenced_profiles.len(),
+                    usage.mounted_containers.len()
+                )
+            };
             add_label(
                 parent,
-                &row.label,
-                rect(38.0, y + 12.0, width - 76.0, 18.0),
+                name,
+                rect(38.0, y + 12.0, width - 154.0, 20.0),
                 mtm,
-                if row.name.is_some() {
-                    TextStyle::Mono
-                } else {
-                    TextStyle::Caption
-                },
+                TextStyle::Heading,
+            );
+            add_label(
+                parent,
+                &format!(
+                    "{} · {} · {}",
+                    metadata.kind, metadata.size, metadata.created
+                ),
+                rect(38.0, y - 10.0, width - 154.0, 18.0),
+                mtm,
+                TextStyle::Caption,
+            );
+            add_label(
+                parent,
+                &usage_summary,
+                rect(38.0, y - 34.0, width - 154.0, 18.0),
+                mtm,
+                TextStyle::Caption,
             );
             if let Some(name) = row.name.as_ref() {
                 let select_index = {
@@ -4120,7 +6116,7 @@ fn add_volumes_list(
                 };
                 add_hit_button(
                     parent,
-                    rect(24.0, y - 42.0, width - 48.0, 76.0),
+                    rect(24.0, y - 62.0, width - 48.0, 96.0),
                     select_index,
                     handler,
                     sel!(selectContainerVolume:),
@@ -4129,24 +6125,39 @@ fn add_volumes_list(
                 let action_index = {
                     let mut actions = VOLUME_DELETE_ACTIONS.lock().unwrap();
                     let action_index = actions.len();
-                    actions.push((inventory.runtime_key.to_string(), name.clone()));
+                    actions.push(VolumeDeleteAction {
+                        runtime: inventory.runtime_key.to_string(),
+                        name: name.clone(),
+                    });
                     action_index
                 };
                 let delete = add_button(
                     parent,
                     "Delete",
-                    rect(38.0, y - 24.0, 76.0, 28.0),
+                    rect(width - 116.0, y - 38.0, 78.0, 28.0),
                     handler,
                     sel!(deleteLocalContainerVolume:),
                     mtm,
                 );
                 unsafe {
                     let _: () = msg_send![&*delete, setTag: action_index as isize];
-                    let _: () = msg_send![&*delete, setToolTip:
-                        &*NSString::from_str("Delete this local volume from the selected runtime")];
+                    let blocked = usage.loading
+                        || usage.error.is_some()
+                        || !usage.mounted_containers.is_empty();
+                    let _: () = msg_send![&*delete, setEnabled: !blocked];
+                    let tooltip = if !usage.mounted_containers.is_empty() {
+                        format!("Mounted by: {}", usage.mounted_containers.join(", "))
+                    } else if usage.loading {
+                        "Wait for the volume usage check to finish".into()
+                    } else if let Some(error) = usage.error.as_deref() {
+                        format!("Usage could not be verified: {error}")
+                    } else {
+                        "Delete this local volume after a dependency check".into()
+                    };
+                    let _: () = msg_send![&*delete, setToolTip: &*NSString::from_str(&tooltip)];
                 }
             }
-            y -= 86.0;
+            y -= 106.0;
         }
         y -= 18.0;
     }
@@ -4163,6 +6174,8 @@ fn add_displays_list(
     MANAGED_DISPLAY_ACTIONS.lock().unwrap().clear();
     let managed_displays = managed_displays_snapshot();
     let pending_displays = pending_managed_displays_snapshot();
+    let closing_displays = closing_managed_displays_snapshot();
+    let active_sessions = active_sessions_snapshot();
     let mut y = content_height - 58.0;
     add_label(
         parent,
@@ -4182,7 +6195,7 @@ fn add_displays_list(
     y -= 36.0;
     add_label(
         parent,
-        "Create a persistent Cocoa-Way window, target it with run_waypipe.sh --display, or assign its slot name to a GUI Session.",
+        "Persistent Cocoa-Way windows for explicit local, remote, and application connections.",
         rect(34.0, y - 30.0, width - 68.0, 44.0),
         mtm,
         TextStyle::Caption,
@@ -4200,7 +6213,10 @@ fn add_displays_list(
         );
         add_label(
             parent,
-            "Starting an independent Wayland display window...",
+            &format!(
+                "{} · Starting an independent Wayland display window...",
+                DisplayStatus::Allocating.label()
+            ),
             rect(38.0, y - 24.0, width - 76.0, 18.0),
             mtm,
             TextStyle::Caption,
@@ -4228,13 +6244,25 @@ fn add_displays_list(
     }
 
     for display in &managed_displays {
+        let attachment_count = active_sessions
+            .iter()
+            .filter(|active| active.instance.display_slot == display.slot)
+            .count();
+        let closing = closing_displays.iter().any(|slot| slot == &display.slot);
+        let status = if closing {
+            DisplayStatus::Closing
+        } else if attachment_count > 0 {
+            DisplayStatus::Attached
+        } else {
+            DisplayStatus::Free
+        };
         let action_index = {
             let mut actions = MANAGED_DISPLAY_ACTIONS.lock().unwrap();
             let index = actions.len();
             actions.push(display.clone());
             index
         };
-        add_card(parent, rect(24.0, y - 90.0, width - 48.0, 118.0), mtm);
+        add_card(parent, rect(24.0, y - 112.0, width - 48.0, 140.0), mtm);
         add_label(
             parent,
             &display.slot,
@@ -4242,267 +6270,308 @@ fn add_displays_list(
             mtm,
             TextStyle::Heading,
         );
-        add_label(
+        let display_performance = worker_performance_snapshot(&display.runtime_dir);
+        let performance_base = format!(
+            "{} · {} attachment{} · process {}",
+            status.label(),
+            attachment_count,
+            if attachment_count == 1 { "" } else { "s" },
+            display.pid,
+        );
+        let performance_label = add_label(
             parent,
-            &format!("{} · display pid {}", display.display, display.pid),
+            &display_fps_text(&performance_base, display_performance.as_ref()),
             rect(38.0, y - 22.0, width - 76.0, 18.0),
             mtm,
             TextStyle::Caption,
         );
+        register_live_display_fps_label(&performance_label, &display.slot, performance_base);
         add_label(
             parent,
             &short_text(
-                &display.runtime_dir,
+                &format!("{}/{}", display.runtime_dir, display.display),
                 chars_for_width(width - 76.0, TextStyle::Mono),
             ),
             rect(38.0, y - 46.0, width - 76.0, 18.0),
             mtm,
             TextStyle::Mono,
         );
+        let focus = add_button(
+            parent,
+            "Focus Window",
+            rect(38.0, y - 104.0, 100.0, 28.0),
+            handler,
+            sel!(focusManagedDisplay:),
+            mtm,
+        );
         let copy_command = add_button(
             parent,
-            "Copy Command",
-            rect(38.0, y - 82.0, 112.0, 28.0),
+            "Copy Connection",
+            rect(146.0, y - 104.0, 116.0, 28.0),
             handler,
             sel!(copyManagedDisplayCommand:),
             mtm,
         );
-        let copy_environment = add_button(
-            parent,
-            "Copy Env",
-            rect(160.0, y - 82.0, 92.0, 28.0),
-            handler,
-            sel!(copyManagedDisplayEnvironment:),
-            mtm,
-        );
         let close = add_button(
             parent,
-            "Close",
-            rect(262.0, y - 82.0, 78.0, 28.0),
+            "Close Display",
+            rect(width - 146.0, y - 104.0, 112.0, 28.0),
             handler,
             sel!(closeManagedDisplay:),
             mtm,
         );
         unsafe {
+            let _: () = msg_send![&*focus, setTag: action_index as isize];
             let _: () = msg_send![&*copy_command, setTag: action_index as isize];
-            let _: () = msg_send![&*copy_environment, setTag: action_index as isize];
             let _: () = msg_send![&*close, setTag: action_index as isize];
+            let _: () = msg_send![&*focus, setEnabled: !closing];
+            let _: () = msg_send![&*copy_command, setEnabled: !closing];
+            let _: () = msg_send![&*close, setEnabled: !closing && attachment_count == 0];
+            let _: () = msg_send![&*focus, setToolTip:
+                &*NSString::from_str("Bring this independent display window to the front")];
             let _: () = msg_send![&*copy_command, setToolTip:
                 &*NSString::from_str("Copy a run_waypipe.sh command prefix for this display")];
-            let _: () = msg_send![&*copy_environment, setToolTip:
-                &*NSString::from_str("Copy XDG_RUNTIME_DIR and WAYLAND_DISPLAY exports")];
+            let close_tooltip = if attachment_count > 0 {
+                "Release the active attachment before closing this display"
+            } else {
+                "Close this Cocoa-Way display window"
+            };
+            let _: () = msg_send![&*close, setToolTip: &*NSString::from_str(close_tooltip)];
         }
-        y -= 128.0;
+        y -= 150.0;
     }
 
     if let Some(error) = MANAGED_DISPLAY_LAST_ERROR.lock().unwrap().as_deref() {
+        add_card(parent, rect(24.0, y - 54.0, width - 48.0, 82.0), mtm);
         add_label(
             parent,
-            &short_text(error, chars_for_width(width - 68.0, TextStyle::Caption)),
-            rect(34.0, y - 20.0, width - 68.0, 34.0),
+            &format!("Last display operation · {}", DisplayStatus::Failed.label()),
+            rect(38.0, y + 2.0, width - 76.0, 20.0),
+            mtm,
+            TextStyle::Heading,
+        );
+        add_label(
+            parent,
+            error,
+            rect(38.0, y - 46.0, width - 76.0, 42.0),
             mtm,
             TextStyle::Caption,
         );
-        y -= 44.0;
+        y -= 94.0;
     }
 
-    y -= 14.0;
+    y -= 18.0;
     add_label(
         parent,
-        "Built-in Display Slots",
+        "Active Attachments",
         rect(34.0, y, width - 68.0, 24.0),
         mtm,
         TextStyle::Title,
     );
+    y -= 30.0;
+    add_label(
+        parent,
+        "Runtime bindings between an application instance and a Cocoa-Way display.",
+        rect(34.0, y - 22.0, width - 68.0, 32.0),
+        mtm,
+        TextStyle::Caption,
+    );
     y -= 42.0;
-
-    add_card(parent, rect(24.0, y - 118.0, width - 48.0, 148.0), mtm);
-    add_label(
-        parent,
-        "Default Display",
-        rect(38.0, y + 8.0, width - 76.0, 22.0),
-        mtm,
-        TextStyle::Heading,
-    );
-    let display_body_width = width - 76.0;
-    add_label(
-        parent,
-        "Current Cocoa-Way Wayland socket and Metal window.",
-        rect(38.0, y - 20.0, display_body_width, 32.0),
-        mtm,
-        TextStyle::Body,
-    );
-    let assigned = sessions
-        .iter()
-        .filter(|session| {
-            matches!(
-                resolved_session_display_target(session),
-                "automatic" | "default"
-            )
-        })
-        .count();
-    let active_assigned = active_display_session_count(sessions);
-    add_label(
-        parent,
-        &format!(
-            "{} profile{} eligible for the default display",
-            assigned,
-            if assigned == 1 { "" } else { "s" }
-        ),
-        rect(38.0, y - 48.0, width - 76.0, 18.0),
-        mtm,
-        TextStyle::Caption,
-    );
-    add_label(
-        parent,
-        &format!(
-            "{} active GUI session{} currently using this display",
-            active_assigned,
-            if active_assigned == 1 { "" } else { "s" }
-        ),
-        rect(38.0, y - 70.0, width - 76.0, 18.0),
-        mtm,
-        TextStyle::Caption,
-    );
-    add_label(
-        parent,
-        "Auto uses this window while it is free, then creates a dedicated display for additional sessions.",
-        rect(38.0, y - 114.0, display_body_width, 32.0),
-        mtm,
-        TextStyle::Caption,
-    );
-    y -= 172.0;
-
-    let dedicated = active_sessions_snapshot()
-        .into_iter()
-        .filter(|active| active.display_slot != "default")
-        .collect::<Vec<_>>();
-    if !dedicated.is_empty() {
+    if active_sessions.is_empty() {
+        add_card(parent, rect(24.0, y - 42.0, width - 48.0, 70.0), mtm);
         add_label(
             parent,
-            "Active Dedicated Displays",
-            rect(34.0, y, width - 68.0, 22.0),
+            "No active display attachments",
+            rect(38.0, y + 2.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Heading,
         );
-        y -= 38.0;
-        for active in dedicated {
-            let managed_display = managed_displays
-                .iter()
-                .find(|display| display.slot == active.display_slot);
-            let session_name = sessions
-                .get(active.index)
+        add_label(
+            parent,
+            "Launch an application to allocate a display at runtime.",
+            rect(38.0, y - 24.0, width - 76.0, 18.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        y -= 82.0;
+    } else {
+        for active in &active_sessions {
+            let session = sessions.get(active.instance.profile_index);
+            let session_name = session
                 .map(|session| session.name.as_str())
-                .unwrap_or("Unknown session");
-            add_card(parent, rect(24.0, y - 36.0, width - 48.0, 68.0), mtm);
+                .unwrap_or("Unknown application");
+            let presentation = session
+                .map(session_presentation_summary)
+                .unwrap_or("unknown");
+            add_card(parent, rect(24.0, y - 76.0, width - 48.0, 104.0), mtm);
             add_label(
                 parent,
                 session_name,
-                rect(38.0, y + 8.0, width - 206.0, 20.0),
+                rect(38.0, y + 2.0, width - 190.0, 20.0),
                 mtm,
                 TextStyle::Heading,
             );
             add_label(
                 parent,
                 &format!(
-                    "{} · display pid {} · waypipe pid {}",
-                    active.display_slot,
-                    active
-                        .display_pid
-                        .or_else(|| managed_display.map(|display| display.pid))
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "starting".into()),
-                    active.waypipe_pid
+                    "{} · instance #{} · {} · {}",
+                    DisplayStatus::Attached.label(),
+                    active.instance.id,
+                    active.instance.display_slot,
+                    presentation
                 ),
-                rect(38.0, y - 16.0, width - 206.0, 18.0),
+                rect(38.0, y - 24.0, width - 190.0, 18.0),
                 mtm,
                 TextStyle::Caption,
             );
-            let stop = add_button(
+            let display_performance = performance_for_active_session(active);
+            let performance_base = format!(
+                "waypipe {} · display process {}",
+                active.instance.waypipe_pid,
+                active
+                    .instance
+                    .display_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "built-in".into()),
+            );
+            let performance_label = add_label(
                 parent,
-                "Stop",
-                rect(width - 124.0, y - 22.0, 76.0, 28.0),
+                &display_fps_text(&performance_base, display_performance.as_ref()),
+                rect(38.0, y - 50.0, width - 190.0, 18.0),
+                mtm,
+                TextStyle::Mono,
+            );
+            register_live_display_fps_label(
+                &performance_label,
+                &active.instance.display_slot,
+                performance_base,
+            );
+            let release = add_button(
+                parent,
+                "Release Display",
+                rect(width - 150.0, y - 28.0, 116.0, 28.0),
                 handler,
-                sel!(stopContainerSession:),
+                sel!(releaseDisplayAttachment:),
                 mtm,
             );
             unsafe {
-                let _: () = msg_send![&*stop, setTag: active.index as isize];
-                let _: () = msg_send![&*stop, setToolTip:
-                &*NSString::from_str(if managed_display.is_some() {
-                    "Stop this session and keep its managed display available"
-                } else {
-                    "Stop this session and close its dedicated display"
-                })];
+                let _: () = msg_send![&*release, setTag: active.instance.profile_index as isize];
+                let _: () = msg_send![&*release, setToolTip:
+                    &*NSString::from_str("Stop this application instance and release its display")];
             }
-            y -= 78.0;
+            y -= 116.0;
         }
-        y -= 18.0;
     }
 
+    y -= 18.0;
     add_label(
         parent,
-        "Assigned Sessions",
-        rect(34.0, y, width - 68.0, 22.0),
+        "Built-in Display",
+        rect(34.0, y, width - 68.0, 24.0),
+        mtm,
+        TextStyle::Title,
+    );
+    y -= 42.0;
+    let default_attachments = active_sessions
+        .iter()
+        .filter(|active| active.instance.display_slot == "default")
+        .count();
+    let built_in_status = if default_attachments > 0 {
+        DisplayStatus::Attached
+    } else {
+        DisplayStatus::Free
+    };
+    add_card(parent, rect(24.0, y - 86.0, width - 48.0, 114.0), mtm);
+    add_label(
+        parent,
+        "Default Display",
+        rect(38.0, y + 2.0, width - 76.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
-    y -= 38.0;
+    add_label(
+        parent,
+        &format!(
+            "{} · {} active attachment{}",
+            built_in_status.label(),
+            default_attachments,
+            if default_attachments == 1 { "" } else { "s" }
+        ),
+        rect(38.0, y - 24.0, width - 76.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    add_label(
+        parent,
+        "The current Cocoa-Way Metal window. Auto uses it while free, then allocates an isolated display.",
+        rect(38.0, y - 76.0, width - 76.0, 44.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    y -= 132.0;
+
+    add_label(
+        parent,
+        "Display Policies",
+        rect(34.0, y, width - 68.0, 24.0),
+        mtm,
+        TextStyle::Title,
+    );
+    y -= 30.0;
+    add_label(
+        parent,
+        "Saved profile preferences. Policies do not reserve a display until an instance launches.",
+        rect(34.0, y - 22.0, width - 68.0, 32.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    y -= 42.0;
     if sessions.is_empty() {
+        add_card(parent, rect(24.0, y - 42.0, width - 48.0, 70.0), mtm);
         add_label(
             parent,
-            "No profiles yet. Create a GUI Session and keep Display set to auto.",
-            rect(38.0, y, width - 76.0, 22.0),
+            "No display policies",
+            rect(38.0, y + 2.0, width - 76.0, 20.0),
+            mtm,
+            TextStyle::Heading,
+        );
+        add_label(
+            parent,
+            "Create an application profile to configure its display policy.",
+            rect(38.0, y - 24.0, width - 76.0, 18.0),
             mtm,
             TextStyle::Caption,
         );
         return;
     }
-    for (index, session) in sessions.iter().enumerate().take(12) {
-        let active = active_session(index);
-        let text_width = if active.is_some() {
-            width - 168.0
+    for session in sessions.iter().take(16) {
+        let target = resolved_session_display_target(session);
+        let policy = if target == "automatic" {
+            "Auto allocation".to_string()
+        } else if target == "default" {
+            "Pinned to built-in display".to_string()
         } else {
-            width - 76.0
+            format!("Named display: {target}")
         };
         add_card(parent, rect(24.0, y - 36.0, width - 48.0, 68.0), mtm);
         add_label(
             parent,
             &session.name,
-            rect(38.0, y + 8.0, text_width, 20.0),
+            rect(38.0, y + 8.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Heading,
         );
         add_label(
             parent,
             &format!(
-                "{} · {}{}",
-                session_display_summary(session),
-                session_display_command(session),
-                active
-                    .as_ref()
-                    .map(|active| format!(" · pid {}", active.waypipe_pid))
-                    .unwrap_or_default()
+                "{} · {} presentation",
+                policy,
+                session_presentation_summary(session)
             ),
-            rect(38.0, y - 16.0, text_width, 18.0),
+            rect(38.0, y - 16.0, width - 76.0, 18.0),
             mtm,
             TextStyle::Caption,
         );
-        if active.is_some() {
-            let stop = add_button(
-                parent,
-                "Stop",
-                rect(width - 124.0, y - 22.0, 76.0, 28.0),
-                handler,
-                sel!(stopContainerSession:),
-                mtm,
-            );
-            unsafe {
-                let _: () = msg_send![&*stop, setTag: index as isize];
-                let _: () = msg_send![&*stop, setToolTip:
-                    &*NSString::from_str("Stop this active session and release its display")];
-            }
-        }
         y -= 78.0;
     }
 }
@@ -4518,6 +6587,7 @@ fn add_runtime_list(
     RUNTIME_CONTAINER_ACTIONS.lock().unwrap().clear();
     RUNTIME_CONTAINER_SELECT_ACTIONS.lock().unwrap().clear();
     DOCKER_CONTEXT_ACTIONS.lock().unwrap().clear();
+    ORBSTACK_MACHINE_ACTIONS.lock().unwrap().clear();
     let runtime = match selected_nav {
         NAV_APPLE_CONTAINER => RuntimeInfoTarget {
             title: "Apple Container",
@@ -4589,7 +6659,7 @@ fn add_runtime_list(
         );
         add_label(
             parent,
-            "Missing",
+            RuntimeStatus::Unavailable.label(),
             rect(38.0, y + 8.0, width - 76.0, 20.0),
             mtm,
             TextStyle::Heading,
@@ -4624,6 +6694,10 @@ fn add_runtime_list(
         return;
     };
 
+    let overview = runtime_overview(selected_nav, &command_path, &child_path);
+    add_runtime_overview_card(parent, width, y, runtime.title, &overview, mtm);
+    y -= 198.0;
+
     add_card(parent, rect(24.0, y - 58.0, width - 48.0, 88.0), mtm);
     add_label(
         parent,
@@ -4642,7 +6716,7 @@ fn add_runtime_list(
     y -= 104.0;
 
     if selected_nav == NAV_APPLE_CONTAINER {
-        add_apple_container_system_controls(parent, width, y, handler, mtm);
+        add_apple_container_system_controls(parent, width, y, overview.status, handler, mtm);
         y -= 156.0;
 
         let compatibility = apple_container_compatibility(&command_path, &child_path);
@@ -4731,11 +6805,55 @@ fn add_runtime_list(
         add_docker_context_inventory(parent, width, y, &child_path, handler, mtm);
         y -= 206.0;
 
+        if let Some(orbctl_path) = find_command_path("orbctl", &child_path) {
+            let running = orbstack_is_running(&orbctl_path, &child_path);
+            let machine_height = add_orbstack_machine_inventory(
+                parent,
+                width,
+                y,
+                &orbctl_path,
+                &child_path,
+                running,
+                handler,
+                mtm,
+            );
+            y -= machine_height + 18.0;
+        } else {
+            add_card(parent, rect(24.0, y - 96.0, width - 48.0, 126.0), mtm);
+            add_label(
+                parent,
+                "OrbStack Provider",
+                rect(38.0, y + 8.0, width - 76.0, 20.0),
+                mtm,
+                TextStyle::Heading,
+            );
+            add_label(
+                parent,
+                "OrbStack is optional. Install or open it to expose Linux machines and its Docker context here.",
+                rect(38.0, y - 42.0, width - 76.0, 42.0),
+                mtm,
+                TextStyle::Caption,
+            );
+            let open = add_button(
+                parent,
+                "Open OrbStack",
+                rect(38.0, y - 82.0, 112.0, 28.0),
+                handler,
+                sel!(openOrbStackApp:),
+                mtm,
+            );
+            unsafe {
+                let _: () = msg_send![&*open, setToolTip:
+                    &*NSString::from_str("Open OrbStack if it is installed")];
+            }
+            y -= 144.0;
+        }
+
         add_docker_container_inventory(parent, width, y, &child_path, handler, mtm);
         y -= 318.0;
     } else if selected_nav == NAV_ORBSTACK {
         let running = orbstack_is_running(&command_path, &child_path);
-        add_orbstack_machine_inventory(
+        let machine_height = add_orbstack_machine_inventory(
             parent,
             width,
             y,
@@ -4745,7 +6863,7 @@ fn add_runtime_list(
             handler,
             mtm,
         );
-        y -= 262.0;
+        y -= machine_height + 18.0;
 
         add_orbstack_docker_inventory(parent, width, y, &child_path, running, handler, mtm);
         y -= 316.0;
@@ -4780,6 +6898,7 @@ fn add_apple_container_system_controls(
     parent: &NSView,
     width: f64,
     y: f64,
+    runtime_status: RuntimeStatus,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
@@ -4840,6 +6959,26 @@ fn add_apple_container_system_controls(
             &*NSString::from_str("Copy `container system status` to the clipboard")];
         let _: () = msg_send![&*open, setToolTip:
             &*NSString::from_str("Open Apple Container's local data root in Finder")];
+        let transitioning = matches!(
+            runtime_status,
+            RuntimeStatus::Starting | RuntimeStatus::Stopping
+        );
+        let can_start = !transitioning
+            && matches!(
+                runtime_status,
+                RuntimeStatus::Unavailable | RuntimeStatus::Failed
+            );
+        let can_stop = !transitioning
+            && matches!(
+                runtime_status,
+                RuntimeStatus::Ready | RuntimeStatus::Degraded
+            );
+        let _: () = msg_send![&*start, setEnabled: can_start];
+        let _: () = msg_send![&*stop, setEnabled: can_stop];
+        if transitioning {
+            let _: () = msg_send![&*start, setTitle:
+                &*NSString::from_str(runtime_status.label())];
+        }
     }
 }
 
@@ -4917,7 +7056,7 @@ fn apple_container_rows(
         }
         Err(error) => vec![RuntimeContainerRow {
             name: None,
-            label: format!("container list failed: {}", error),
+            label: ui_command_error("container list failed", &error),
             running: false,
         }],
     }
@@ -5061,8 +7200,15 @@ fn add_orbstack_machine_inventory(
     running: bool,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
-) {
-    add_card(parent, rect(24.0, y - 214.0, width - 48.0, 244.0), mtm);
+) -> f64 {
+    let rows = orbstack_machine_rows(command_path, child_path, running);
+    let visible_rows = rows.iter().take(3).collect::<Vec<_>>();
+    let card_height = 142.0 + visible_rows.len() as f64 * 62.0;
+    add_card(
+        parent,
+        rect(24.0, y - card_height + 30.0, width - 48.0, card_height),
+        mtm,
+    );
     add_label(
         parent,
         "Machines",
@@ -5072,7 +7218,7 @@ fn add_orbstack_machine_inventory(
     );
     add_label(
         parent,
-        "OrbStack machines are separate from Docker containers and shown read-only here.",
+        "Manage OrbStack Linux machines independently from Docker-compatible containers.",
         rect(38.0, y - 38.0, width - 76.0, 32.0),
         mtm,
         TextStyle::Caption,
@@ -5103,18 +7249,133 @@ fn add_orbstack_machine_inventory(
         let _: () = msg_send![&*stop, setEnabled: running];
     }
 
-    let lines = orbstack_machine_lines(command_path, child_path, running);
-    let mut line_y = y - 116.0;
-    for line in lines.iter().take(5) {
+    let mut row_y = y - 116.0;
+    for row in visible_rows {
+        add_orbstack_machine_row(parent, width, row_y, row, handler, mtm);
+        row_y -= 62.0;
+    }
+
+    card_height
+}
+
+fn add_orbstack_machine_row(
+    parent: &NSView,
+    width: f64,
+    y: f64,
+    row: &OrbStackMachineRow,
+    handler: *mut AnyObject,
+    mtm: MainThreadMarker,
+) {
+    add_card(parent, rect(38.0, y - 42.0, width - 76.0, 54.0), mtm);
+    let Some(name) = row.name.as_ref() else {
         add_label(
             parent,
-            line,
-            rect(38.0, line_y, width - 76.0, 18.0),
+            &row.label,
+            rect(52.0, y - 4.0, width - 104.0, 18.0),
             mtm,
-            TextStyle::Mono,
+            TextStyle::Body,
         );
-        line_y -= 22.0;
+        add_label(
+            parent,
+            &short_text(
+                &row.detail,
+                chars_for_width(width - 104.0, TextStyle::Caption),
+            ),
+            rect(52.0, y - 26.0, width - 104.0, 18.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        return;
+    };
+
+    let controls_width = 222.0;
+    let text_width = (width - controls_width - 98.0).max(92.0);
+    add_label(
+        parent,
+        &short_text(&row.label, chars_for_width(text_width, TextStyle::Body)),
+        rect(52.0, y - 4.0, text_width, 18.0),
+        mtm,
+        TextStyle::Body,
+    );
+    add_label(
+        parent,
+        &short_text(&row.detail, chars_for_width(text_width, TextStyle::Caption)),
+        rect(52.0, y - 26.0, text_width, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+
+    let action_index = push_orbstack_machine_action(name);
+    let primary = add_button(
+        parent,
+        if row.running { "Stop" } else { "Start" },
+        rect(width - 246.0, y - 20.0, 64.0, 26.0),
+        handler,
+        if row.running {
+            sel!(stopOrbStackMachine:)
+        } else {
+            sel!(startOrbStackMachine:)
+        },
+        mtm,
+    );
+    let shell = add_button(
+        parent,
+        "Shell",
+        rect(width - 176.0, y - 20.0, 64.0, 26.0),
+        handler,
+        sel!(openOrbStackMachineTerminal:),
+        mtm,
+    );
+    let delete = add_button(
+        parent,
+        "Delete",
+        rect(width - 106.0, y - 20.0, 68.0, 26.0),
+        handler,
+        sel!(deleteOrbStackMachine:),
+        mtm,
+    );
+    unsafe {
+        for button in [&primary, &shell, &delete] {
+            let _: () = msg_send![&**button, setTag: action_index as isize];
+        }
+        let _: () = msg_send![&*primary, setToolTip:
+            &*NSString::from_str(if row.running { "Stop this OrbStack machine" } else { "Start this OrbStack machine" })];
+        let _: () = msg_send![&*shell, setToolTip:
+            &*NSString::from_str("Open an interactive shell for this machine in macOS Terminal")];
+        let _: () = msg_send![&*delete, setToolTip:
+            &*NSString::from_str("Permanently delete this machine after confirmation")];
     }
+}
+
+fn push_orbstack_machine_action(name: &str) -> usize {
+    let mut actions = ORBSTACK_MACHINE_ACTIONS.lock().unwrap();
+    let index = actions.len();
+    actions.push(name.to_string());
+    index
+}
+
+fn orbstack_machine_action_name(sender: &AnyObject) -> Option<String> {
+    let tag: isize = unsafe { msg_send![sender, tag] };
+    let name = ORBSTACK_MACHINE_ACTIONS
+        .lock()
+        .unwrap()
+        .get(tag.max(0) as usize)
+        .cloned();
+    if name.is_none() {
+        show_error_alert("OrbStack machine action no longer exists. Press Reload and try again.");
+    }
+    name
+}
+
+fn send_orbstack_machine_action(sender: &AnyObject, action: &str) {
+    let Some(name) = orbstack_machine_action_name(sender) else {
+        return;
+    };
+    send(CompositorMessage::RuntimeMachineAction {
+        runtime: "orbstack".into(),
+        name,
+        action: action.into(),
+    });
 }
 
 fn add_orbstack_docker_inventory(
@@ -5219,7 +7480,7 @@ fn add_runtime_container_row(
             mtm,
         );
     }
-    let text_width = width - 246.0;
+    let text_width = width - 282.0;
     add_label(
         parent,
         &short_text(&row.label, chars_for_width(text_width, TextStyle::Mono)),
@@ -5241,7 +7502,7 @@ fn add_runtime_container_row(
     };
     add_hit_button(
         parent,
-        rect(38.0, y - 36.0, (width - 236.0).max(96.0), 46.0),
+        rect(38.0, y - 36.0, (width - 272.0).max(96.0), 46.0),
         select_index,
         handler,
         sel!(selectRuntimeContainer:),
@@ -5251,8 +7512,12 @@ fn add_runtime_container_row(
     let action_index = push_runtime_container_action(runtime, name);
     let primary = add_button(
         parent,
-        if row.running { "Stop" } else { "Start" },
-        rect(width - 184.0, y - 12.0, 68.0, 24.0),
+        if row.running {
+            "Stop Container"
+        } else {
+            "Start Container"
+        },
+        rect(width - 226.0, y - 12.0, 108.0, 24.0),
         handler,
         if row.running {
             sel!(stopRuntimeContainer:)
@@ -5264,9 +7529,9 @@ fn add_runtime_container_row(
     unsafe {
         let _: () = msg_send![&*primary, setTag: action_index as isize];
         let tooltip = if row.running {
-            "Stop this Docker-compatible container"
+            "Stop this runtime container"
         } else {
-            "Start this Docker-compatible container"
+            "Start this stopped runtime container"
         };
         let _: () = msg_send![&*primary, setToolTip: &*NSString::from_str(tooltip)];
     }
@@ -5275,15 +7540,20 @@ fn add_runtime_container_row(
     let delete = add_button(
         parent,
         "Delete",
-        rect(width - 106.0, y - 12.0, 72.0, 24.0),
+        rect(width - 108.0, y - 12.0, 74.0, 24.0),
         handler,
         sel!(deleteRuntimeContainer:),
         mtm,
     );
     unsafe {
         let _: () = msg_send![&*delete, setTag: action_index as isize];
+        let _: () = msg_send![&*delete, setEnabled: !row.running];
         let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Delete this Docker-compatible container after confirmation")];
+        &*NSString::from_str(if row.running {
+            "Stop this container before deleting it"
+        } else {
+            "Delete this stopped container after confirmation"
+        })];
     }
 }
 
@@ -5349,7 +7619,7 @@ fn docker_context_rows(child_path: &str) -> Vec<DockerContextRow> {
         }],
         Err(error) => vec![DockerContextRow {
             name: None,
-            label: format!("Docker context list failed: {}", error),
+            label: ui_command_error("Docker context list failed", &error),
             current: false,
         }],
     }
@@ -5426,7 +7696,7 @@ fn docker_container_rows(child_path: &str) -> Vec<RuntimeContainerRow> {
         }],
         Err(error) => vec![RuntimeContainerRow {
             name: None,
-            label: format!("Docker container list failed: {}", error),
+            label: ui_command_error("Docker container list failed", &error),
             running: false,
         }],
     }
@@ -5448,38 +7718,117 @@ fn orbstack_is_running(command_path: &std::path::Path, child_path: &str) -> bool
     })
 }
 
-fn orbstack_machine_lines(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OrbStackMachineRow {
+    name: Option<String>,
+    label: String,
+    detail: String,
+    running: bool,
+}
+
+fn orbstack_machine_rows(
     command_path: &std::path::Path,
     child_path: &str,
     running: bool,
-) -> Vec<String> {
-    let status = command_preview_lines(command_path, child_path, &["status"])
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "Status unknown".into());
-    let mut lines = vec![format!("Status: {}", short_text(&status, 70))];
-
+) -> Vec<OrbStackMachineRow> {
     if !running {
-        lines.push("Inventory paused while OrbStack is stopped".into());
-        return lines;
+        return vec![OrbStackMachineRow {
+            name: None,
+            label: "OrbStack is stopped".into(),
+            detail: "Start OrbStack to inspect its Linux machines.".into(),
+            running: false,
+        }];
     }
 
-    match run_ui_command(command_path, child_path, &["list"], Duration::from_secs(2)) {
+    match run_ui_command(
+        command_path,
+        child_path,
+        &["list", "--format", "json"],
+        Duration::from_secs(2),
+    ) {
         Ok(output) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            let machine_lines = stdout
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| short_text(line, 92));
-            lines.extend(machine_lines);
+            match parse_orbstack_machine_rows(&stdout) {
+                Ok(rows) if !rows.is_empty() => rows,
+                Ok(_) => vec![OrbStackMachineRow {
+                    name: None,
+                    label: "No OrbStack machines".into(),
+                    detail: "Create or import a machine from OrbStack first.".into(),
+                    running: false,
+                }],
+                Err(error) => vec![OrbStackMachineRow {
+                    name: None,
+                    label: "Machine list could not be parsed".into(),
+                    detail: error,
+                    running: false,
+                }],
+            }
         }
-        Ok(output) => lines.push(first_stderr_line(&output, "Machine list failed")),
-        Err(error) => lines.push(format!("Machine list failed: {}", error)),
+        Ok(output) => vec![OrbStackMachineRow {
+            name: None,
+            label: "Machine list failed".into(),
+            detail: first_stderr_line(&output, "OrbStack returned an error"),
+            running: false,
+        }],
+        Err(error) => vec![OrbStackMachineRow {
+            name: None,
+            label: if error == UI_COMMAND_LOADING {
+                UI_COMMAND_LOADING.into()
+            } else {
+                "Machine list failed".into()
+            },
+            detail: if error == UI_COMMAND_LOADING {
+                "Checking OrbStack in the background.".into()
+            } else {
+                error
+            },
+            running: false,
+        }],
     }
-    if lines.len() == 1 {
-        lines.push("No machines listed".into());
+}
+
+fn parse_orbstack_machine_rows(json: &str) -> Result<Vec<OrbStackMachineRow>, String> {
+    let values = serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .map_err(|error| format!("Invalid OrbStack JSON: {}", error))?;
+    let mut rows = Vec::with_capacity(values.len());
+    for value in values {
+        let Some(name) = value.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let state = value
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let distro = value
+            .pointer("/image/distro")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Linux");
+        let version = value
+            .pointer("/image/version")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let arch = value
+            .pointer("/image/arch")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let image = [distro, version]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detail = [state, image.as_str(), arch]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        rows.push(OrbStackMachineRow {
+            name: Some(name.to_string()),
+            label: name.to_string(),
+            detail,
+            running: state.eq_ignore_ascii_case("running"),
+        });
     }
-    lines
+    Ok(rows)
 }
 
 fn format_docker_container_row(line: &str) -> RuntimeContainerRow {
@@ -5513,6 +7862,206 @@ struct RuntimeInfoTarget {
     checks: Vec<RuntimeCheck>,
 }
 
+struct RuntimeOverview {
+    status: RuntimeStatus,
+    detail: String,
+    version: String,
+    resources: String,
+    provider: String,
+}
+
+fn runtime_overview(
+    selected_nav: usize,
+    command_path: &std::path::Path,
+    child_path: &str,
+) -> RuntimeOverview {
+    let runtime_key = match selected_nav {
+        NAV_APPLE_CONTAINER => "apple",
+        NAV_ORBSTACK => "orbstack",
+        _ => "docker",
+    };
+    let operation = runtime_system_state(runtime_key);
+    let version = command_preview_lines(command_path, child_path, &["--version"])
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "Version unavailable".into());
+
+    let (live_status, detail, resources, provider) = match selected_nav {
+        NAV_APPLE_CONTAINER => {
+            let compatibility = apple_container_compatibility(command_path, child_path);
+            let system = compatibility.system_status.to_ascii_lowercase();
+            let status = if system.contains("running") {
+                RuntimeStatus::Ready
+            } else if system.contains("stop") || system.contains("not running") {
+                RuntimeStatus::Unavailable
+            } else if system.contains("fail") || system.contains("error") {
+                RuntimeStatus::Failed
+            } else {
+                RuntimeStatus::Degraded
+            };
+            let running = apple_container_rows(command_path, child_path)
+                .iter()
+                .filter(|row| row.name.is_some() && row.running)
+                .count();
+            (
+                status,
+                compatibility.detail,
+                format_count(running, "running container"),
+                if compatibility.publish_socket {
+                    "GUI Transport V2".into()
+                } else {
+                    "Compatibility relay".into()
+                },
+            )
+        }
+        NAV_ORBSTACK => {
+            let status_output = run_ui_command(
+                command_path,
+                child_path,
+                &["status"],
+                Duration::from_secs(2),
+            );
+            let (status, detail) = match status_output {
+                Ok(output) if output.status.success() => {
+                    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if text.eq_ignore_ascii_case("running") {
+                        (
+                            RuntimeStatus::Ready,
+                            "OrbStack services are running.".into(),
+                        )
+                    } else {
+                        (RuntimeStatus::Unavailable, format!("OrbStack is {text}."))
+                    }
+                }
+                Ok(output) => (
+                    RuntimeStatus::Failed,
+                    first_stderr_line(&output, "OrbStack status failed"),
+                ),
+                Err(error) if error == UI_COMMAND_LOADING => (
+                    RuntimeStatus::Degraded,
+                    "Checking OrbStack status in the background.".into(),
+                ),
+                Err(error) => (RuntimeStatus::Failed, error),
+            };
+            let running =
+                orbstack_machine_rows(command_path, child_path, status == RuntimeStatus::Ready)
+                    .iter()
+                    .filter(|row| row.name.is_some() && row.running)
+                    .count();
+            (
+                status,
+                detail,
+                format_count(running, "running machine"),
+                "OrbStack provider".into(),
+            )
+        }
+        _ => {
+            let info = run_ui_command(
+                command_path,
+                child_path,
+                &["info", "--format", "{{.ServerVersion}}"],
+                Duration::from_secs(2),
+            );
+            let (status, detail) = match info {
+                Ok(output) if output.status.success() => (
+                    RuntimeStatus::Ready,
+                    format!(
+                        "Connected to Docker Engine {}.",
+                        String::from_utf8_lossy(&output.stdout).trim()
+                    ),
+                ),
+                Ok(output) => (
+                    RuntimeStatus::Unavailable,
+                    first_stderr_line(&output, "Cannot connect to the Docker endpoint"),
+                ),
+                Err(error) if error == UI_COMMAND_LOADING => (
+                    RuntimeStatus::Degraded,
+                    "Checking the active Docker context in the background.".into(),
+                ),
+                Err(error) => (RuntimeStatus::Failed, error),
+            };
+            let running = docker_container_rows(child_path)
+                .iter()
+                .filter(|row| row.name.is_some() && row.running)
+                .count();
+            let context = docker_context_rows(child_path)
+                .into_iter()
+                .find(|row| row.current)
+                .and_then(|row| row.name)
+                .unwrap_or_else(|| "No active context".into());
+            (
+                status,
+                detail,
+                format_count(running, "running container"),
+                format!("Context: {context}"),
+            )
+        }
+    };
+
+    let (status, detail) = operation
+        .filter(|state| {
+            matches!(
+                state.status,
+                RuntimeStatus::Starting | RuntimeStatus::Stopping
+            )
+        })
+        .map(|state| (state.status, state.detail))
+        .unwrap_or((live_status, detail));
+    RuntimeOverview {
+        status,
+        detail,
+        version,
+        resources,
+        provider,
+    }
+}
+
+fn add_runtime_overview_card(
+    parent: &NSView,
+    width: f64,
+    y: f64,
+    title: &str,
+    overview: &RuntimeOverview,
+    mtm: MainThreadMarker,
+) {
+    add_card(parent, rect(24.0, y - 152.0, width - 48.0, 182.0), mtm);
+    add_label(
+        parent,
+        title,
+        rect(38.0, y + 8.0, width - 190.0, 20.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    add_label(
+        parent,
+        overview.status.label(),
+        rect(width - 142.0, y + 8.0, 104.0, 20.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    add_label(
+        parent,
+        &overview.detail,
+        rect(38.0, y - 40.0, width - 76.0, 42.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    add_label(
+        parent,
+        &format!("Version\n{}", overview.version),
+        rect(38.0, y - 104.0, (width - 92.0) * 0.52, 50.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    add_label(
+        parent,
+        &format!("Resources\n{}\n{}", overview.resources, overview.provider),
+        rect(width * 0.55, y - 126.0, width * 0.45 - 38.0, 72.0),
+        mtm,
+        TextStyle::Caption,
+    );
+}
+
 struct RuntimeCheck {
     label: &'static str,
     args: &'static [&'static str],
@@ -5528,6 +8077,67 @@ fn run_ui_command(
     command: &std::path::Path,
     child_path: &str,
     args: &[&str],
+    timeout: Duration,
+) -> Result<Arc<Output>, String> {
+    let key = ui_command_cache_key(command, child_path, args);
+    let cached = UI_COMMAND_CACHE.lock().unwrap().get(&key).cloned();
+    let stale = cached
+        .as_ref()
+        .is_none_or(|entry| entry.completed_at.elapsed() >= UI_COMMAND_CACHE_TTL);
+    if stale {
+        refresh_ui_command(
+            key,
+            command.to_path_buf(),
+            child_path.to_string(),
+            args.iter().map(|argument| argument.to_string()).collect(),
+            timeout,
+        );
+    }
+    cached.map_or_else(|| Err(UI_COMMAND_LOADING.into()), |entry| entry.result)
+}
+
+fn ui_command_cache_key(command: &std::path::Path, child_path: &str, args: &[&str]) -> String {
+    let mut key = command.as_os_str().to_string_lossy().into_owned();
+    key.push('\0');
+    key.push_str(child_path);
+    for argument in args {
+        key.push('\0');
+        key.push_str(argument);
+    }
+    key
+}
+
+fn refresh_ui_command(
+    key: String,
+    command: std::path::PathBuf,
+    child_path: String,
+    args: Vec<String>,
+    timeout: Duration,
+) {
+    {
+        let mut refreshing = UI_COMMAND_REFRESHING.lock().unwrap();
+        if !refreshing.insert(key.clone()) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let result = execute_ui_command(&command, &child_path, &args, timeout).map(Arc::new);
+        UI_COMMAND_CACHE.lock().unwrap().insert(
+            key.clone(),
+            UiCommandCacheEntry {
+                completed_at: Instant::now(),
+                result,
+            },
+        );
+        UI_COMMAND_REFRESHING.lock().unwrap().remove(&key);
+        send(CompositorMessage::ContainerModeCommandCacheUpdated);
+    });
+}
+
+fn execute_ui_command(
+    command: &std::path::Path,
+    child_path: &str,
+    args: &[String],
     timeout: Duration,
 ) -> Result<Output, String> {
     let mut child = Command::new(command)
@@ -5551,6 +8161,38 @@ fn run_ui_command(
             }
             Err(error) => return Err(error.to_string()),
         }
+    }
+}
+
+fn invalidate_ui_command_cache() {
+    UI_COMMAND_CACHE.lock().unwrap().clear();
+    *APPLE_COMPATIBILITY_CACHE.lock().unwrap() = None;
+}
+
+fn ui_command_error(prefix: &str, error: &str) -> String {
+    if error == UI_COMMAND_LOADING {
+        UI_COMMAND_LOADING.into()
+    } else {
+        format!("{}: {}", prefix, error)
+    }
+}
+
+pub fn record_command_cache_updated() {
+    *APPLE_COMPATIBILITY_CACHE.lock().unwrap() = None;
+    let rebuilt = unsafe { rebuild_window_throttled(Duration::from_millis(100)) };
+    if !rebuilt && !COMMAND_CACHE_REFRESH_PENDING.swap(true, Ordering::AcqRel) {
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            send(CompositorMessage::ContainerModeCommandCacheRefreshDue);
+        });
+    }
+}
+
+pub fn record_command_cache_refresh_due() {
+    COMMAND_CACHE_REFRESH_PENDING.store(false, Ordering::Release);
+    *LAST_STREAM_REBUILD.lock().unwrap() = Some(Instant::now());
+    unsafe {
+        rebuild_window();
     }
 }
 
@@ -5624,7 +8266,7 @@ fn apple_container_compatibility(
         "Compatible with Cocoa-Way".into()
     };
     let detail = if !versions_match {
-        "The CLI and API server differ. Restart or reinstall Apple Container before launching GUI sessions."
+        "The CLI and API server differ. Restart or reinstall Apple Container before launching applications."
             .into()
     } else if !publish_socket {
         "Cocoa-Way can use its compatibility relay, but Transport V2 requires `container run --publish-socket`."
@@ -5712,7 +8354,7 @@ fn command_preview_lines(
                     .to_string(),
             ]
         }
-        Err(error) => vec![format!("Command failed: {}", error)],
+        Err(error) => vec![ui_command_error("Command failed", &error)],
     }
 }
 
@@ -5855,12 +8497,14 @@ fn apple_registry_login_summary(child_path: &str) -> String {
     let Some(path) = find_command_path("container", child_path) else {
         return "Registry login unavailable: Apple Container is not installed.".into();
     };
-    let output = Command::new(path)
-        .env("PATH", child_path)
-        .args(["registry", "list", "--quiet"])
-        .output();
+    let output = run_ui_command(
+        &path,
+        child_path,
+        &["registry", "list", "--quiet"],
+        Duration::from_secs(2),
+    );
     let Ok(output) = output else {
-        return "Registry login status unavailable.".into();
+        return UI_COMMAND_LOADING.into();
     };
     if !output.status.success() {
         return "Registry login status unavailable.".into();
@@ -5895,6 +8539,243 @@ fn volume_inventories() -> Vec<VolumeInventory> {
     ]
 }
 
+fn volume_usage(runtime_key: &str, volume_name: &str) -> VolumeUsage {
+    let referenced_profiles = container_sessions::load_sessions()
+        .into_iter()
+        .filter(|session| {
+            runtime_key_matches(runtime_key, &session.runtime)
+                && session
+                    .mounts
+                    .iter()
+                    .any(|mount| mount_references_volume(mount, volume_name))
+        })
+        .map(|session| session.name)
+        .collect::<Vec<_>>();
+    let child_path = build_child_path();
+    let (command, args) = if runtime_key == "docker" {
+        let filter = format!("volume={volume_name}");
+        (
+            "docker",
+            vec![
+                "ps".into(),
+                "-a".into(),
+                "--filter".into(),
+                filter,
+                "--format".into(),
+                "{{.Names}}".into(),
+            ],
+        )
+    } else {
+        (
+            "container",
+            vec![
+                "list".into(),
+                "--all".into(),
+                "--format".into(),
+                "json".into(),
+            ],
+        )
+    };
+    let Some(command_path) = find_command_path(command, &child_path) else {
+        return VolumeUsage {
+            referenced_profiles,
+            error: Some(format!("{} is not installed", runtime_label(runtime_key))),
+            ..VolumeUsage::default()
+        };
+    };
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    match run_ui_command(
+        &command_path,
+        &child_path,
+        &arg_refs,
+        Duration::from_secs(2),
+    ) {
+        Ok(output) if output.status.success() => {
+            let parsed = if runtime_key == "docker" {
+                Ok(String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>())
+            } else {
+                parse_apple_volume_mounts(&String::from_utf8_lossy(&output.stdout), volume_name)
+            };
+            match parsed {
+                Ok(mut mounted_containers) => {
+                    mounted_containers.sort();
+                    mounted_containers.dedup();
+                    VolumeUsage {
+                        referenced_profiles,
+                        mounted_containers,
+                        ..VolumeUsage::default()
+                    }
+                }
+                Err(error) => VolumeUsage {
+                    referenced_profiles,
+                    error: Some(error),
+                    ..VolumeUsage::default()
+                },
+            }
+        }
+        Ok(output) => VolumeUsage {
+            referenced_profiles,
+            error: Some(first_stderr_line(&output, "Volume usage check failed")),
+            ..VolumeUsage::default()
+        },
+        Err(error) if error == UI_COMMAND_LOADING => VolumeUsage {
+            referenced_profiles,
+            loading: true,
+            ..VolumeUsage::default()
+        },
+        Err(error) => VolumeUsage {
+            referenced_profiles,
+            error: Some(ui_command_error("Volume usage check failed", &error)),
+            ..VolumeUsage::default()
+        },
+    }
+}
+
+fn mount_references_volume(mount: &str, volume_name: &str) -> bool {
+    let mount = mount.trim();
+    if mount == volume_name
+        || mount
+            .strip_prefix(volume_name)
+            .is_some_and(|rest| rest.starts_with(':'))
+    {
+        return true;
+    }
+    mount.split(',').any(|part| {
+        let Some((key, value)) = part.trim().split_once('=') else {
+            return false;
+        };
+        matches!(key.trim(), "source" | "src" | "volume" | "name") && value.trim() == volume_name
+    })
+}
+
+fn parse_apple_volume_mounts(json: &str, volume_name: &str) -> Result<Vec<String>, String> {
+    let containers = serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .map_err(|error| format!("Apple Container returned invalid container JSON: {error}"))?;
+    Ok(containers
+        .into_iter()
+        .filter_map(|container| {
+            let configuration = container.get("configuration")?;
+            let mounted = configuration
+                .get("mounts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|mounts| {
+                    mounts.iter().any(|mount| {
+                        mount.get("source").and_then(serde_json::Value::as_str) == Some(volume_name)
+                    })
+                });
+            mounted.then(|| {
+                container
+                    .get("id")
+                    .or_else(|| configuration.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Unknown container")
+                    .to_string()
+            })
+        })
+        .collect())
+}
+
+fn volume_metadata(label: &str, name: &str) -> String {
+    label
+        .strip_prefix(name)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Managed volume")
+        .to_string()
+}
+
+fn volume_inspect_metadata(runtime_key: &str, name: &str, label: &str) -> VolumeMetadata {
+    let fallback_kind = volume_metadata(label, name);
+    let child_path = build_child_path();
+    let command = if runtime_key == "docker" {
+        "docker"
+    } else {
+        "container"
+    };
+    let Some(command_path) = find_command_path(command, &child_path) else {
+        return VolumeMetadata {
+            kind: fallback_kind,
+            size: "Unavailable".into(),
+            created: "Unavailable".into(),
+        };
+    };
+    let args = ["volume", "inspect", name];
+    match run_ui_command(&command_path, &child_path, &args, Duration::from_secs(2)) {
+        Ok(output) if output.status.success() => {
+            parse_volume_inspect_metadata(&output.stdout, &fallback_kind).unwrap_or(
+                VolumeMetadata {
+                    kind: fallback_kind,
+                    size: "Unknown".into(),
+                    created: "Unknown".into(),
+                },
+            )
+        }
+        Err(error) if error == UI_COMMAND_LOADING => VolumeMetadata {
+            kind: fallback_kind,
+            size: "Loading...".into(),
+            created: "Loading...".into(),
+        },
+        _ => VolumeMetadata {
+            kind: fallback_kind,
+            size: "Unavailable".into(),
+            created: "Unavailable".into(),
+        },
+    }
+}
+
+fn parse_volume_inspect_metadata(bytes: &[u8], fallback_kind: &str) -> Option<VolumeMetadata> {
+    let root = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let value = root
+        .as_array()
+        .and_then(|values| values.first())
+        .unwrap_or(&root);
+    let string_field = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::to_string)
+    };
+    let kind = string_field(&["Driver", "driver", "Type", "type"])
+        .unwrap_or_else(|| fallback_kind.to_string());
+    let size = ["Size", "size", "sizeInBytes", "size_in_bytes"]
+        .iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .map(format_byte_count)
+                .or_else(|| value.as_str().map(str::to_string))
+        })
+        .unwrap_or_else(|| "Unknown".into());
+    let created = string_field(&["CreatedAt", "createdAt", "creationDate", "created"])
+        .unwrap_or_else(|| "Unknown".into());
+    Some(VolumeMetadata {
+        kind,
+        size,
+        created,
+    })
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
+    }
+}
+
 fn apple_container_image_rows(child_path: &str) -> Vec<ImageRow> {
     let Some(path) = find_command_path("container", child_path) else {
         return vec![ImageRow::message("container not installed")];
@@ -5921,7 +8802,10 @@ fn apple_container_image_rows(child_path: &str) -> Vec<ImageRow> {
             &output,
             "Image list failed",
         ))],
-        Err(error) => vec![ImageRow::message(format!("Image list failed: {}", error))],
+        Err(error) => vec![ImageRow::message(ui_command_error(
+            "Image list failed",
+            &error,
+        ))],
     }
 }
 
@@ -5951,7 +8835,10 @@ fn apple_container_volume_rows(child_path: &str) -> Vec<VolumeRow> {
             &output,
             "Volume list failed",
         ))],
-        Err(error) => vec![VolumeRow::message(format!("Volume list failed: {}", error))],
+        Err(error) => vec![VolumeRow::message(ui_command_error(
+            "Volume list failed",
+            &error,
+        ))],
     }
 }
 
@@ -5985,9 +8872,9 @@ fn docker_image_rows(child_path: &str) -> Vec<ImageRow> {
             &output,
             "Docker image list failed",
         ))],
-        Err(error) => vec![ImageRow::message(format!(
-            "Docker image list failed: {}",
-            error
+        Err(error) => vec![ImageRow::message(ui_command_error(
+            "Docker image list failed",
+            &error,
         ))],
     }
 }
@@ -6017,9 +8904,9 @@ fn docker_volume_rows(child_path: &str) -> Vec<VolumeRow> {
             &output,
             "Docker volume list failed",
         ))],
-        Err(error) => vec![VolumeRow::message(format!(
-            "Docker volume list failed: {}",
-            error
+        Err(error) => vec![VolumeRow::message(ui_command_error(
+            "Docker volume list failed",
+            &error,
         ))],
     }
 }
@@ -6102,6 +8989,64 @@ impl ImageRow {
     }
 }
 
+fn runtime_key_matches(runtime_key: &str, session_runtime: &str) -> bool {
+    let normalized_session_runtime = session_runtime.trim().to_ascii_lowercase();
+    match runtime_key.trim().to_ascii_lowercase().as_str() {
+        "container" | "apple" | "apple container" => !matches!(
+            normalized_session_runtime.as_str(),
+            "docker" | "orb" | "orbstack"
+        ),
+        "docker" => matches!(
+            normalized_session_runtime.as_str(),
+            "docker" | "orb" | "orbstack"
+        ),
+        other => other == normalized_session_runtime,
+    }
+}
+
+fn image_reference_has_tag(reference: &str) -> bool {
+    let last_slash = reference.rfind('/');
+    reference
+        .rfind(':')
+        .is_some_and(|colon| last_slash.is_none_or(|slash| colon > slash))
+}
+
+fn split_image_reference(reference: &str) -> (&str, &str) {
+    let last_slash = reference.rfind('/');
+    if let Some(colon) = reference
+        .rfind(':')
+        .filter(|colon| last_slash.is_none_or(|slash| *colon > slash))
+    {
+        (&reference[..colon], &reference[colon + 1..])
+    } else {
+        (reference, "<none>")
+    }
+}
+
+fn image_id_from_label(label: &str, reference: &str) -> Option<String> {
+    label
+        .strip_prefix(reference)
+        .and_then(|metadata| metadata.split_whitespace().next())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn image_references_for_id(runtime_key: &str, image_id: &str) -> Vec<String> {
+    let mut references = image_inventories()
+        .into_iter()
+        .filter(|inventory| inventory.runtime_key == runtime_key)
+        .flat_map(|inventory| inventory.rows)
+        .filter_map(|row| {
+            let reference = row.reference?;
+            (image_id_from_label(&row.label, &reference).as_deref() == Some(image_id))
+                .then_some(reference)
+        })
+        .collect::<Vec<_>>();
+    references.sort();
+    references.dedup();
+    references
+}
+
 impl VolumeRow {
     fn message(message: impl Into<String>) -> Self {
         Self {
@@ -6134,41 +9079,45 @@ fn add_detail_panel(
     selected_tab: usize,
     selected_nav: usize,
     selected_session: Option<(usize, &ContainerSession)>,
+    scroll_key: String,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
     let compact_toolbar = width < 560.0;
-    let open_w = if compact_toolbar { 64.0 } else { 112.0 };
-    let open_x = x + width - open_w - 24.0;
-    add_button(
-        parent,
-        if compact_toolbar {
-            "Config"
+    if matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
+        let tab_x = if compact_toolbar {
+            x + 122.0
         } else {
-            "Open Config"
-        },
-        rect(open_x, height - 47.0, open_w, 30.0),
-        handler,
-        sel!(openContainerConfig:),
-        mtm,
-    );
-    if selected_nav == NAV_SESSIONS {
-        let tab_x = if compact_toolbar { x + 50.0 } else { x + 70.0 };
-        let max_tab_w = (open_x - tab_x - 18.0).max(190.0);
-        let tab_w = max_tab_w.min(360.0);
-        add_button(
+            x + 144.0
+        };
+        let max_tab_w = (x + width - tab_x - 24.0).max(190.0);
+        let tab_w = max_tab_w.min(440.0);
+        let terminal = add_button(
             parent,
-            "+",
+            "New Terminal",
             rect(
                 if compact_toolbar { x + 12.0 } else { x + 22.0 },
                 height - 47.0,
-                if compact_toolbar { 30.0 } else { 34.0 },
+                if compact_toolbar { 104.0 } else { 112.0 },
                 30.0,
             ),
             handler,
-            sel!(addContainerSession:),
+            sel!(openContainerTerminal:),
             mtm,
         );
+        unsafe {
+            if let Some((index, _)) =
+                selected_session.filter(|(index, _)| active_session(*index).is_some())
+            {
+                let _: () = msg_send![&*terminal, setTag: index as isize];
+                let _: () = msg_send![&*terminal, setToolTip:
+                    &*NSString::from_str("Open a terminal in the running application instance")];
+            } else {
+                let _: () = msg_send![&*terminal, setEnabled: false];
+                let _: () = msg_send![&*terminal, setToolTip:
+                    &*NSString::from_str("Launch an application instance before opening its terminal")];
+            }
+        }
         add_tab_bar(
             parent,
             tab_x,
@@ -6182,15 +9131,14 @@ fn add_detail_panel(
         add_label(
             parent,
             nav_title(selected_nav),
-            rect(x + 28.0, height - 44.0, open_x - x - 52.0, 26.0),
+            rect(x + 28.0, height - 44.0, width - 56.0, 26.0),
             mtm,
             TextStyle::Title,
         );
     }
     add_separator(parent, rect(x, height - 64.0, width, 1.0), mtm);
 
-    let compact_summary = width < 560.0;
-    let summary_height = if compact_summary { 108.0 } else { 72.0 };
+    let summary_height = 72.0;
     let scroll_height = (height - 64.0 - summary_height).max(240.0);
     let scroll = unsafe {
         NSScrollView::initWithFrame(
@@ -6209,11 +9157,13 @@ fn add_detail_panel(
         .filter(|container| runtime_nav(&container.runtime) == selected_nav);
     let document_width = (width - 14.0).max(320.0);
     let document_height = if selected_session.is_some() {
-        820.0_f64.max(scroll_height)
+        // Application details are intentionally split into independent cards. Keep the
+        // document tall enough for narrow-window wrapping and the eight-stage task view.
+        2200.0_f64.max(scroll_height)
     } else if selected_runtime.is_some() {
         860.0_f64.max(scroll_height)
     } else if matches!(selected_nav, NAV_IMAGES | NAV_VOLUMES) {
-        700.0_f64.max(scroll_height)
+        900.0_f64.max(scroll_height)
     } else {
         scroll_height
     };
@@ -6238,7 +9188,7 @@ fn add_detail_panel(
             handler,
             mtm,
         );
-    } else if selected_nav == NAV_SESSIONS {
+    } else if matches!(selected_nav, NAV_SESSIONS | NAV_RUNNING) {
         let content_x = 42.0;
         let content_y = document_height * 0.52;
         add_label(
@@ -6327,12 +9277,71 @@ fn add_detail_panel(
         scroll.setDocumentView(Some(&document));
         let clip_view: Retained<AnyObject> = msg_send_id![&*scroll, contentView];
         let top_y = (document_height - scroll_height).max(0.0);
-        let _: () = msg_send![&*clip_view, scrollToPoint: NSPoint { x: 0.0, y: top_y }];
+        let saved_y = saved_scroll_position(&scroll_key, top_y).clamp(0.0, top_y);
+        let _: () = msg_send![&*clip_view, scrollToPoint: NSPoint { x: 0.0, y: saved_y }];
         let _: () = msg_send![&*scroll, reflectScrolledClipView: &*clip_view];
         parent.addSubview(&scroll);
+        *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(TrackedScrollView {
+            pointer: (&*scroll as *const NSScrollView) as usize,
+            key: scroll_key,
+        });
     }
     add_separator(parent, rect(x, summary_height, width, 1.0), mtm);
-    add_runtime_summary(parent, x + 28.0, 4.0, width - 56.0, compact_summary, mtm);
+    add_runtime_summary(parent, x + 28.0, 4.0, width - 56.0, mtm);
+}
+
+fn detail_scroll_key(
+    selected_nav: usize,
+    selected_tab: usize,
+    selected_session: Option<usize>,
+) -> String {
+    if let Some(index) = selected_session {
+        return format!("detail:{selected_nav}:application:{index}:tab:{selected_tab}");
+    }
+    if selected_nav == NAV_IMAGES {
+        return SELECTED_IMAGE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|image| format!("detail:{selected_nav}:image:{}", image.reference))
+            .unwrap_or_else(|| format!("detail:{selected_nav}:empty"));
+    }
+    if selected_nav == NAV_VOLUMES {
+        return SELECTED_VOLUME
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|volume| format!("detail:{selected_nav}:volume:{}", volume.name))
+            .unwrap_or_else(|| format!("detail:{selected_nav}:empty"));
+    }
+    if let Some(container) = SELECTED_RUNTIME_CONTAINER.lock().unwrap().as_ref() {
+        if runtime_nav(&container.runtime) == selected_nav {
+            return format!("detail:{selected_nav}:container:{}", container.name);
+        }
+    }
+    format!("detail:{selected_nav}:empty")
+}
+
+unsafe fn capture_tracked_scroll_position(slot: &Mutex<Option<TrackedScrollView>>) {
+    let Some(tracked) = slot.lock().unwrap().clone() else {
+        return;
+    };
+    let scroll = unsafe { &*(tracked.pointer as *const NSScrollView) };
+    let clip_view: Retained<AnyObject> = unsafe { msg_send_id![scroll, contentView] };
+    let bounds: NSRect = unsafe { msg_send![&*clip_view, bounds] };
+    SCROLL_POSITIONS
+        .lock()
+        .unwrap()
+        .insert(tracked.key, bounds.origin.y);
+}
+
+fn saved_scroll_position(key: &str, default_y: f64) -> f64 {
+    SCROLL_POSITIONS
+        .lock()
+        .unwrap()
+        .get(key)
+        .copied()
+        .unwrap_or(default_y)
 }
 
 fn add_session_detail(
@@ -6360,7 +9369,7 @@ fn add_session_detail(
     add_label(
         parent,
         &format!(
-            "{} session backed by {}",
+            "{} application backed by {}",
             runtime_label(&session.runtime),
             session.image
         ),
@@ -6378,14 +9387,14 @@ fn add_session_detail(
     let launch_busy = active.is_some() || session_is_launch_busy(state);
     let check = add_button(
         parent,
-        "Check",
-        rect(content_x, actions_y, 82.0, 30.0),
+        "Run Health Check",
+        rect(content_x, actions_y, 128.0, 30.0),
         handler,
         sel!(checkContainerSession:),
         mtm,
     );
     let primary_label = if launch_busy {
-        state.map(|state| state.label).unwrap_or("Running")
+        state.map(session_state_label).unwrap_or("Running")
     } else if transport_blocked {
         "Blocked"
     } else if missing_image {
@@ -6413,7 +9422,7 @@ fn add_session_detail(
         sel!(launchContainerSession:)
     };
     let primary_tooltip = if launch_busy {
-        "This session is already active. Stop it before launching again."
+        "This application already has an active instance. Stop it before launching again."
     } else if transport_blocked {
         "Apple Container GUI relay is currently unavailable"
     } else if missing_image {
@@ -6425,40 +9434,33 @@ fn add_session_detail(
             "Pull the missing image before launching"
         }
     } else {
-        "Launch this GUI session"
+        "Launch this application"
     };
     let primary = add_button(
         parent,
         primary_label,
-        rect(content_x + 92.0, actions_y, 88.0, 30.0),
+        rect(content_x + 138.0, actions_y, 88.0, 30.0),
         handler,
         primary_selector,
         mtm,
     );
+    let force_stop = state.is_some_and(|state| state.force_stop_available);
     let stop = add_button(
         parent,
-        "Stop",
-        rect(content_x + 190.0, actions_y, 78.0, 30.0),
+        if force_stop { "Force Stop" } else { "Stop" },
+        rect(content_x + 236.0, actions_y, 92.0, 30.0),
         handler,
-        sel!(stopContainerSession:),
-        mtm,
-    );
-    let delete = add_button(
-        parent,
-        "Delete Profile",
-        if compact_actions {
-            rect(content_x + 196.0, secondary_y, 106.0, 28.0)
+        if force_stop {
+            sel!(forceStopContainerSession:)
         } else {
-            rect(content_x + 278.0, actions_y, 112.0, 30.0)
+            sel!(stopContainerSession:)
         },
-        handler,
-        sel!(deleteContainerSession:),
         mtm,
     );
     unsafe {
         let _: () = msg_send![&*check, setTag: index as isize];
         let _: () = msg_send![&*check, setToolTip:
-            &*NSString::from_str("Run preflight checks without launching")];
+            &*NSString::from_str("Validate the profile, runtime, image, command, and transport without launching")];
         let _: () = msg_send![&*primary, setTag: index as isize];
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(primary_tooltip)];
@@ -6467,13 +9469,14 @@ fn add_session_detail(
         }
         let _: () = msg_send![&*stop, setTag: index as isize];
         let _: () = msg_send![&*stop, setToolTip:
-            &*NSString::from_str("Stop the tracked or named container session")];
+        &*NSString::from_str(if force_stop {
+            "Immediately terminate the application after graceful stop timed out"
+        } else {
+            "Ask the running application instance to exit gracefully"
+        })];
         if !stop_enabled {
             let _: () = msg_send![&*stop, setEnabled: false];
         }
-        let _: () = msg_send![&*delete, setTag: index as isize];
-        let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Remove this GUI profile from container-sessions.toml; images remain installed")];
     }
 
     let edit = add_button(
@@ -6489,29 +9492,74 @@ fn add_session_detail(
         sel!(editContainerSession:),
         mtm,
     );
-    let duplicate = add_button(
+    let more = add_popup(
         parent,
-        "Duplicate",
         rect(
             content_x + if compact_actions { 102.0 } else { 114.0 },
             secondary_y,
-            if compact_actions { 84.0 } else { 96.0 },
+            if compact_actions { 112.0 } else { 142.0 },
             28.0,
         ),
-        handler,
-        sel!(duplicateContainerSession:),
+        &[
+            "More…",
+            "Duplicate Profile",
+            "Export Profile",
+            "View Raw Configuration",
+            "Delete Profile",
+        ],
+        0,
         mtm,
     );
     unsafe {
         let _: () = msg_send![&*edit, setTag: index as isize];
         let _: () = msg_send![&*edit, setToolTip:
-            &*NSString::from_str("Edit this profile. Running containers are not changed until next launch.")];
-        let _: () = msg_send![&*duplicate, setTag: index as isize];
-        let _: () = msg_send![&*duplicate, setToolTip:
-            &*NSString::from_str("Create a copy of this profile for another image, command, or display target")];
+            &*NSString::from_str("Edit this saved application profile. Running instances are not changed until their next launch.")];
+        let _: () = msg_send![&*more, setTarget: handler];
+        let _: () = msg_send![&*more, setAction:
+            sel!(applicationProfileMoreAction:)];
+        let _: () = msg_send![&*more, setTag: index as isize];
+        let _: () = msg_send![&*more, setToolTip:
+        &*NSString::from_str(if stop_enabled || launch_busy {
+            "Duplicate, export, or inspect this profile. Stop the running instance before deleting it."
+        } else {
+            "Duplicate, export, inspect, or delete this saved application profile"
+        })];
     }
 
-    let panel_top = secondary_y - 24.0;
+    let presentation_y = if compact_actions {
+        secondary_y - 38.0
+    } else {
+        secondary_y
+    };
+    let presentation = add_popup(
+        parent,
+        rect(
+            content_x + if compact_actions { 0.0 } else { 270.0 },
+            presentation_y,
+            170.0,
+            28.0,
+        ),
+        &["Desktop compositor", "Rootless Wayland apps"],
+        usize::from(session.presentation_mode().is_rootless()),
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*presentation, setTarget: handler];
+        let _: () = msg_send![&*presentation, setAction:
+            sel!(changeContainerSessionPresentation:)];
+        let _: () = msg_send![&*presentation, setTag: index as isize];
+        let _: () = msg_send![&*presentation, setToolTip:
+            &*NSString::from_str("Use desktop for a compositor such as niri/Hyprland, or rootless for native Wayland applications such as foot")];
+        if active.is_some() {
+            let _: () = msg_send![&*presentation, setEnabled: false];
+        }
+    }
+
+    let panel_top = if compact_actions {
+        presentation_y - 24.0
+    } else {
+        secondary_y - 24.0
+    };
     match selected_tab {
         1 => add_session_logs(
             parent,
@@ -6547,7 +9595,7 @@ fn add_session_detail(
             session,
             state,
             content_x,
-            panel_top - 334.0,
+            panel_top,
             width - 84.0,
             handler,
             mtm,
@@ -6561,114 +9609,571 @@ fn add_session_info(
     session: &ContainerSession,
     state: Option<&SessionState>,
     x: f64,
+    top: f64,
+    width: f64,
+    handler: *mut AnyObject,
+    mtm: MainThreadMarker,
+) {
+    let derived_transport_blocked = session_has_apple_transport_block(session);
+    let active = active_session(index);
+    let profile_status = state
+        .map(|state| state.profile.label().to_string())
+        .unwrap_or_else(|| "Checking".into());
+    let instance_status = active
+        .as_ref()
+        .map(|active| active.instance.status.label().to_string())
+        .or_else(|| {
+            state
+                .and_then(|state| state.instance)
+                .map(|status| status.label().to_string())
+        })
+        .unwrap_or_else(|| "Not running".into());
+    let overview_rows = vec![
+        ("Profile status".to_string(), profile_status),
+        ("Instance status".to_string(), instance_status),
+        (
+            "Runtime".to_string(),
+            runtime_label(&session.runtime).to_string(),
+        ),
+        (
+            "Presentation".to_string(),
+            session_presentation_summary(session).to_string(),
+        ),
+        ("Image".to_string(), session.image.clone()),
+        ("Command".to_string(), session_display_command(session)),
+        (
+            "Display policy".to_string(),
+            session_display_summary(session),
+        ),
+    ];
+    let mut cursor =
+        add_labeled_rows_card(parent, "Overview", &overview_rows, x, top, width, mtm) - 18.0;
+
+    let configuration_rows = vec![
+        ("Waypipe".to_string(), session_waypipe_summary(session)),
+        (
+            "CPU".to_string(),
+            runtime_arg_value(&session.runtime_args, "--cpus")
+                .unwrap_or_else(|| "Runtime default".into()),
+        ),
+        (
+            "Memory".to_string(),
+            runtime_arg_value(&session.runtime_args, "--memory")
+                .unwrap_or_else(|| "Runtime default".into()),
+        ),
+        (
+            "Shared memory".to_string(),
+            runtime_arg_value(&session.runtime_args, "--shm-size")
+                .unwrap_or_else(|| "Runtime default".into()),
+        ),
+        (
+            "Audio".to_string(),
+            if session.audio {
+                "48 kHz stereo playback".into()
+            } else {
+                "Off".into()
+            },
+        ),
+        (
+            "Mounts".to_string(),
+            format_count(session.mounts.len(), "mount"),
+        ),
+        (
+            "Environment".to_string(),
+            format_count(session.env.len(), "variable"),
+        ),
+    ];
+    cursor = add_labeled_rows_card(
+        parent,
+        "Configuration",
+        &configuration_rows,
+        x,
+        cursor,
+        width,
+        mtm,
+    ) - 18.0;
+
+    if !session.runtime_args.is_empty() {
+        cursor =
+            add_runtime_arguments_card(parent, &session.runtime_args, x, cursor, width, mtm) - 18.0;
+    }
+
+    let instance_rows = if let Some(active) = active.as_ref() {
+        vec![
+            ("Instance".to_string(), format!("#{}", active.instance.id)),
+            (
+                "Status".to_string(),
+                active.instance.status.label().to_string(),
+            ),
+            (
+                "Started".to_string(),
+                elapsed_time_label(active.instance.started_at_unix_ms),
+            ),
+            (
+                "Container".to_string(),
+                container_sessions::container_name(session),
+            ),
+            ("Display".to_string(), active.instance.display_slot.clone()),
+        ]
+    } else {
+        vec![
+            ("Status".to_string(), "No running instances".into()),
+            (
+                "Next launch".to_string(),
+                format!(
+                    "Uses the {} display policy",
+                    session_display_target(session)
+                ),
+            ),
+        ]
+    };
+    cursor = add_labeled_rows_card(
+        parent,
+        "Running Instances",
+        &instance_rows,
+        x,
+        cursor,
+        width,
+        mtm,
+    ) - 18.0;
+
+    let status_detail = active
+        .as_ref()
+        .map(|_| "Application process and Waypipe worker are tracked by Cocoa-Way.".to_string())
+        .or_else(|| state.map(|state| state.detail.clone()))
+        .unwrap_or_else(|| {
+            if derived_transport_blocked {
+                apple_transport_blocked_detail(session)
+            } else {
+                "Run Health Check to validate this application before launch.".into()
+            }
+        });
+    let mut diagnostic_rows = vec![
+        (
+            "Health".to_string(),
+            state
+                .map(|state| session_state_label(state).to_string())
+                .unwrap_or_else(|| "Not checked".into()),
+        ),
+        ("Detail".to_string(), status_detail),
+    ];
+    if let Some(step) = state.and_then(|state| state.failed_step) {
+        diagnostic_rows.push(("Failed step".to_string(), step.label().into()));
+    }
+    if let Some(active) = active.as_ref() {
+        diagnostic_rows.push((
+            "Processes".to_string(),
+            format!(
+                "container {}; waypipe {}",
+                active
+                    .instance
+                    .container_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "managed by runtime".into()),
+                active.instance.waypipe_pid
+            ),
+        ));
+    }
+    let diagnostics_bottom = add_labeled_rows_card(
+        parent,
+        "Diagnostics",
+        &diagnostic_rows,
+        x,
+        cursor,
+        width,
+        mtm,
+    );
+    let actions_height = 52.0;
+    let actions_y = diagnostics_bottom - actions_height;
+    add_detail_card(parent, x, actions_y, width, actions_height, mtm);
+    let diagnostics_buttons_y = actions_y + 12.0;
+    let logs = add_button(
+        parent,
+        "View Logs",
+        rect(x + width - 242.0, diagnostics_buttons_y, 96.0, 28.0),
+        handler,
+        sel!(selectContainerTab:),
+        mtm,
+    );
+    let raw = add_button(
+        parent,
+        "Raw Config",
+        rect(x + width - 136.0, diagnostics_buttons_y, 112.0, 28.0),
+        handler,
+        sel!(viewRawContainerSession:),
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*logs, setTag: 1isize];
+        let _: () = msg_send![&*raw, setTag: index as isize];
+    }
+
+    let launch_task = latest_operation_task(&launch_task_key(index))
+        .filter(|task| task.status != TaskStatus::Completed);
+    let mut supporting_card_y = actions_y - 116.0;
+    if let Some(task) = launch_task.as_ref() {
+        let task_height = 86.0
+            + task.steps.len() as f64 * 22.0
+            + if task.status == TaskStatus::Failed {
+                38.0
+            } else {
+                0.0
+            };
+        let task_y = actions_y - 18.0 - task_height;
+        add_application_task_card(parent, task, x, task_y, width, handler, mtm);
+        supporting_card_y = task_y - 114.0;
+    } else if state.is_some_and(|state| {
+        state.profile == ProfileStatus::Invalid || state.instance == Some(InstanceStatus::Failed)
+    }) {
+        let error_y = actions_y - 130.0;
+        add_application_error_card(
+            parent,
+            index,
+            state.unwrap(),
+            x,
+            error_y,
+            width,
+            handler,
+            mtm,
+        );
+        supporting_card_y = error_y - 114.0;
+    }
+
+    if state.is_some_and(is_missing_image_state) {
+        add_missing_image_card(
+            parent,
+            index,
+            session,
+            x,
+            supporting_card_y,
+            width,
+            handler,
+            mtm,
+        );
+    } else if state.is_some_and(is_apple_container_stopped_state) {
+        add_apple_container_stopped_card(parent, x, supporting_card_y, width, handler, mtm);
+    } else if derived_transport_blocked {
+        add_apple_container_transport_card(parent, x, supporting_card_y - 14.0, width, mtm);
+    } else {
+        add_display_note_card(parent, index, session, x, supporting_card_y, width, mtm);
+    }
+}
+
+fn add_labeled_rows_card(
+    parent: &NSView,
+    title: &str,
+    rows: &[(String, String)],
+    x: f64,
+    top: f64,
+    width: f64,
+    mtm: MainThreadMarker,
+) -> f64 {
+    let value_width = (width - 44.0 - 124.0).max(80.0);
+    let row_heights = rows
+        .iter()
+        .map(|(_, value)| session_detail_row_height(value, value_width))
+        .collect::<Vec<_>>();
+    let card_height = 58.0 + row_heights.iter().sum::<f64>();
+    let card_y = top - card_height;
+    add_detail_card(parent, x, card_y, width, card_height, mtm);
+    add_label(
+        parent,
+        title,
+        rect(x + 22.0, top - 38.0, width - 44.0, 22.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    let mut row_y = top - 68.0;
+    for ((key, value), row_height) in rows.iter().zip(row_heights) {
+        add_session_detail_row(parent, key, value, x + 22.0, row_y, width - 44.0, mtm);
+        row_y -= row_height;
+    }
+    card_y
+}
+
+fn add_runtime_arguments_card(
+    parent: &NSView,
+    arguments: &[String],
+    x: f64,
+    top: f64,
+    width: f64,
+    mtm: MainThreadMarker,
+) -> f64 {
+    let text = format_runtime_arguments(arguments);
+    let lines = text.lines().count().max(1).min(10);
+    let text_height = lines as f64 * line_height_for_style(TextStyle::Mono);
+    let height = 62.0 + text_height;
+    let y = top - height;
+    add_detail_card(parent, x, y, width, height, mtm);
+    add_label(
+        parent,
+        "Runtime Arguments",
+        rect(x + 22.0, top - 38.0, width - 44.0, 22.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    let label = add_label(
+        parent,
+        &text,
+        rect(x + 22.0, y + 16.0, width - 44.0, text_height),
+        mtm,
+        TextStyle::Mono,
+    );
+    unsafe {
+        label.setSelectable(true);
+        let _: () = msg_send![&*label, setToolTip: &*NSString::from_str(&text)];
+    }
+    y
+}
+
+fn runtime_arg_value(arguments: &[String], flag: &str) -> Option<String> {
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument == flag {
+            return arguments.get(index + 1).cloned();
+        }
+        if let Some(value) = argument.strip_prefix(&format!("{}=", flag)) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn format_runtime_arguments(arguments: &[String]) -> String {
+    let mut lines = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument.starts_with("--")
+            && !argument.contains('=')
+            && arguments
+                .get(index + 1)
+                .is_some_and(|value| !value.starts_with("--"))
+        {
+            lines.push(format!("{} {}", argument, arguments[index + 1]));
+            index += 2;
+        } else {
+            lines.push(argument.clone());
+            index += 1;
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_count(count: usize, noun: &str) -> String {
+    format!("{} {}{}", count, noun, if count == 1 { "" } else { "s" })
+}
+
+fn elapsed_time_label(started_at_unix_ms: u128) -> String {
+    let elapsed_ms = now_unix_ms().saturating_sub(started_at_unix_ms);
+    let seconds = elapsed_ms / 1_000;
+    if seconds < 60 {
+        format!("{}s ago", seconds)
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else {
+        format!("{}d ago", seconds / 86_400)
+    }
+}
+
+fn add_application_task_card(
+    parent: &NSView,
+    task: &OperationTask,
+    x: f64,
     y: f64,
     width: f64,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    add_detail_card(parent, x, y, width, 334.0, mtm);
-    let derived_transport_blocked = session_has_apple_transport_block(session);
-    let active = active_session(index);
-    let mut rows = vec![
-        (
-            "Status".to_string(),
-            active
-                .as_ref()
-                .map(|_| "Running".to_string())
-                .or_else(|| state.map(|state| state.label.to_string()))
-                .unwrap_or_else(|| {
-                    if derived_transport_blocked {
-                        "Blocked".into()
-                    } else {
-                        "Not launched".into()
-                    }
-                }),
-        ),
-        (
-            "Status detail".to_string(),
-            active
-                .as_ref()
-                .map(|active| {
-                    let container_pid = active
-                        .container_pid
-                        .map(|pid| pid.to_string())
-                        .unwrap_or_else(|| "Apple Container".into());
-                    format!(
-                        "tracked: container {}; waypipe {}",
-                        container_pid, active.waypipe_pid
-                    )
-                })
-                .or_else(|| state.map(|state| compact_detail(&state.detail)))
-                .unwrap_or_else(|| {
-                    if derived_transport_blocked {
-                        compact_detail(&apple_transport_blocked_detail(session))
-                    } else {
-                        "Run Check to validate before launch.".into()
-                    }
-                }),
-        ),
-        (
-            "Runtime".to_string(),
-            runtime_label(&session.runtime).to_string(),
-        ),
-        ("Display".to_string(), session_display_summary(session)),
-        ("Image".to_string(), session.image.clone()),
-        (
-            "Container name".to_string(),
-            container_sessions::container_name(session),
-        ),
-        (
-            "Profile".to_string(),
-            session
-                .profile
-                .as_deref()
-                .unwrap_or("single-app")
-                .to_string(),
-        ),
-        ("Command".to_string(), session_display_command(session)),
-        ("Waypipe".to_string(), session_waypipe_summary(session)),
-        (
-            "Display use".to_string(),
-            display_occupancy_summary(index, session),
-        ),
-    ];
-    if let Some(socket) = session.socket.as_deref().filter(|value| !value.is_empty()) {
-        rows.push(("Host socket".to_string(), socket.to_string()));
-    }
-    if let Some(socket) = session
-        .container_socket
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        rows.push(("Container socket".to_string(), socket.to_string()));
-    }
-    if !session.runtime_args.is_empty() {
-        rows.push((
-            "Runtime args".to_string(),
-            list_or_empty(&session.runtime_args),
-        ));
-    }
-    if !session.mounts.is_empty() {
-        rows.push(("Mounts".to_string(), list_or_empty(&session.mounts)));
-    }
-    if !session.env.is_empty() {
-        rows.push(("Environment".to_string(), list_or_empty(&session.env)));
+    let failed = task.status == TaskStatus::Failed;
+    let height = 86.0 + task.steps.len() as f64 * 22.0 + if failed { 38.0 } else { 0.0 };
+    add_detail_card(parent, x, y, width, height, mtm);
+    add_label(
+        parent,
+        &task.operation,
+        rect(x + 22.0, y + height - 36.0, width - 148.0, 22.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    add_label(
+        parent,
+        task.status.label(),
+        rect(x + width - 118.0, y + height - 34.0, 96.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let detail = task.detail.as_deref().unwrap_or("Operation in progress");
+    let detail_label = add_label(
+        parent,
+        &short_text(detail, chars_for_width(width - 44.0, TextStyle::Caption)),
+        rect(x + 22.0, y + height - 60.0, width - 44.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    unsafe {
+        let _: () = msg_send![&*detail_label, setToolTip: &*NSString::from_str(detail)];
     }
 
-    let mut row_y = y + 290.0;
-    for (key, value) in rows {
-        add_detail_row(parent, &key, &value, x + 22.0, row_y, width - 44.0, mtm);
-        row_y -= 26.0;
+    let mut row_y = y + height - 84.0;
+    for step in &task.steps {
+        let status = match step.status {
+            TaskStepStatus::Pending => "Pending",
+            TaskStepStatus::Running => "In progress",
+            TaskStepStatus::Completed => "Done",
+            TaskStepStatus::Failed => "Failed",
+        };
+        add_label(
+            parent,
+            status,
+            rect(x + 22.0, row_y, 88.0, 18.0),
+            mtm,
+            TextStyle::Caption,
+        );
+        add_label(
+            parent,
+            &step.name,
+            rect(x + 116.0, row_y - 1.0, width - 138.0, 20.0),
+            mtm,
+            TextStyle::Body,
+        );
+        row_y -= 22.0;
     }
 
-    if state.is_some_and(is_missing_image_state) {
-        add_missing_image_card(parent, index, session, x, y - 98.0, width, handler, mtm);
-    } else if state.is_some_and(is_apple_container_stopped_state) {
-        add_apple_container_stopped_card(parent, x, y - 98.0, width, handler, mtm);
-    } else if derived_transport_blocked {
-        add_apple_container_transport_card(parent, x, y - 112.0, width, mtm);
+    if failed {
+        let view_error = add_button(
+            parent,
+            "View Details",
+            rect(x + 22.0, y + 10.0, 104.0, 28.0),
+            handler,
+            sel!(selectContainerTab:),
+            mtm,
+        );
+        unsafe {
+            let _: () = msg_send![&*view_error, setTag: 1isize];
+            let _: () = msg_send![&*view_error, setToolTip:
+                &*NSString::from_str("Open captured launch logs for this failure")];
+        }
+    }
+}
+
+fn add_application_error_card(
+    parent: &NSView,
+    index: usize,
+    state: &SessionState,
+    x: f64,
+    y: f64,
+    width: f64,
+    handler: *mut AnyObject,
+    mtm: MainThreadMarker,
+) {
+    add_detail_card(parent, x, y, width, 112.0, mtm);
+    let title = state
+        .failed_step
+        .map(|step| format!("{} failed", step.label()))
+        .unwrap_or_else(|| "Application validation failed".into());
+    add_label(
+        parent,
+        &title,
+        rect(x + 22.0, y + 78.0, width - 44.0, 22.0),
+        mtm,
+        TextStyle::Heading,
+    );
+    let detail = compact_detail(&state.detail);
+    let detail_label = add_label(
+        parent,
+        &detail,
+        rect(x + 22.0, y + 50.0, width - 44.0, 20.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    unsafe {
+        let _: () = msg_send![&*detail_label, setToolTip: &*NSString::from_str(&state.detail)];
+    }
+    let retry = add_button(
+        parent,
+        "Retry Check",
+        rect(x + 22.0, y + 10.0, 104.0, 28.0),
+        handler,
+        sel!(checkContainerSession:),
+        mtm,
+    );
+    let view_error = add_button(
+        parent,
+        "View Details",
+        rect(x + 136.0, y + 10.0, 104.0, 28.0),
+        handler,
+        sel!(selectContainerTab:),
+        mtm,
+    );
+    let copy_diagnostics = add_button(
+        parent,
+        "Copy Diagnostics",
+        rect(
+            x + 250.0,
+            y + 10.0,
+            (width - 272.0).clamp(92.0, 124.0),
+            28.0,
+        ),
+        handler,
+        sel!(copyApplicationDiagnostics:),
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*retry, setTag: index as isize];
+        let _: () = msg_send![&*view_error, setTag: 1isize];
+        let _: () = msg_send![&*copy_diagnostics, setTag: index as isize];
+        let _: () = msg_send![&*copy_diagnostics, setToolTip:
+            &*NSString::from_str("Copy profile, state, display, and recent logs")];
+    }
+}
+
+fn session_detail_row_height(value: &str, value_width: f64) -> f64 {
+    let line_chars = chars_for_width(value_width, TextStyle::Body);
+    if value.chars().count() > line_chars {
+        42.0
     } else {
-        add_display_note_card(parent, index, session, x, y - 98.0, width, mtm);
+        26.0
+    }
+}
+
+fn add_session_detail_row(
+    parent: &NSView,
+    key: &str,
+    value: &str,
+    x: f64,
+    y: f64,
+    width: f64,
+    mtm: MainThreadMarker,
+) {
+    add_label(
+        parent,
+        key,
+        rect(x, y, 112.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    let value_width = (width - 124.0).max(80.0);
+    let row_height = session_detail_row_height(value, value_width);
+    let max_chars =
+        chars_for_width(value_width, TextStyle::Body) * if row_height > 26.0 { 2 } else { 1 };
+    let visible = short_text(value, max_chars);
+    let label = add_label(
+        parent,
+        &visible,
+        rect(
+            x + 124.0,
+            if row_height > 26.0 { y - 17.0 } else { y - 1.0 },
+            value_width,
+            if row_height > 26.0 { 36.0 } else { 20.0 },
+        ),
+        mtm,
+        TextStyle::Body,
+    );
+    if visible != value {
+        unsafe {
+            let _: () = msg_send![&*label, setToolTip: &*NSString::from_str(value)];
+        }
     }
 }
 
@@ -6768,7 +10273,7 @@ fn add_missing_image_card(
         unsafe {
             let _: () = msg_send![&*pull, setTag: index as isize];
             let _: () = msg_send![&*pull, setToolTip:
-                &*NSString::from_str("Pull the session image with Apple Container")];
+                &*NSString::from_str("Pull the application image with Apple Container")];
         }
         button_x += 106.0;
     }
@@ -6849,8 +10354,24 @@ fn add_display_note_card(
 ) {
     let requested = session_display_target(session);
     let active = active_session(index);
-    let (title, detail, behavior) = if let Some(active) = active {
-        if active.display_slot == "default" {
+    let display_slot = active
+        .as_ref()
+        .map(|active| active.instance.display_slot.clone());
+    let telemetry = active_session_performance(index);
+    let (title, detail, behavior) = if session.presentation_mode().is_rootless() {
+        (
+            "Rootless Wayland apps".to_string(),
+            "Each native Wayland app toplevel is mapped to its own macOS window.".to_string(),
+            if active.is_some() {
+                "An isolated compositor worker owns this application until it is stopped."
+                    .to_string()
+            } else {
+                "Launch creates an isolated worker without occupying the desktop display."
+                    .to_string()
+            },
+        )
+    } else if let Some(active) = active.as_ref() {
+        if active.instance.display_slot == "default" {
             (
                 "Default display".to_string(),
                 "This session is using the current Cocoa-Way display window.".to_string(),
@@ -6858,7 +10379,7 @@ fn add_display_note_card(
             )
         } else {
             (
-                format!("Dedicated display: {}", active.display_slot),
+                format!("Dedicated display: {}", active.instance.display_slot),
                 "This session owns an independent Metal window and Wayland socket.".to_string(),
                 "Stopping the session also closes and cleans up its display worker.".to_string(),
             )
@@ -6883,13 +10404,16 @@ fn add_display_note_card(
         )
     };
     add_detail_card(parent, x, y, width, 96.0, mtm);
-    add_label(
+    let title_label = add_label(
         parent,
-        &title,
+        &display_fps_text(&title, telemetry.as_ref()),
         rect(x + 22.0, y + 60.0, width - 44.0, 20.0),
         mtm,
         TextStyle::Heading,
     );
+    if let Some(display_slot) = display_slot {
+        register_live_display_fps_label(&title_label, display_slot, title);
+    }
     add_label(
         parent,
         &detail,
@@ -7028,6 +10552,11 @@ fn add_session_terminal(
         let _: () = msg_send![&*button, setTag: index as isize];
         let _: () = msg_send![&*button, setToolTip:
             &*NSString::from_str("Open macOS Terminal and attach to this running GUI container")];
+        if active_session(index).is_none() {
+            let _: () = msg_send![&*button, setEnabled: false];
+            let _: () = msg_send![&*button, setToolTip:
+                &*NSString::from_str("Launch this application before opening a shell")];
+        }
     }
 }
 
@@ -7050,7 +10579,7 @@ fn add_session_files(
     if session.mounts.is_empty() {
         add_label(
             parent,
-            "Declare mounts in container-sessions.toml to share project folders with this GUI session.",
+            "Declare mounts in container-sessions.toml to share project folders with this application.",
             rect(x + 22.0, y + 94.0, width - 44.0, 34.0),
             mtm,
             TextStyle::Body,
@@ -7151,65 +10680,118 @@ fn add_image_detail(
     let delete_index = {
         let mut actions = IMAGE_DELETE_ACTIONS.lock().unwrap();
         let action_index = actions.len();
-        actions.push((image.runtime_key.clone(), image.reference.clone()));
+        actions.push(ImageDeleteAction {
+            runtime: image.runtime_key.clone(),
+            reference: image.reference.clone(),
+            image_id: image_id_from_label(&image.label, &image.reference),
+        });
         action_index
     };
     let create = add_button(
         parent,
-        "Add Session",
-        rect(content_x, header_y - 72.0, 112.0, 30.0),
+        "Create Application",
+        rect(content_x, header_y - 72.0, 142.0, 30.0),
         handler,
         sel!(createContainerSessionFromImage:),
         mtm,
     );
-    let delete = add_button(
+    let image_has_tag = image_reference_has_tag(&image.reference);
+    let more = add_popup(
         parent,
-        "Delete",
-        rect(content_x + 124.0, header_y - 72.0, 84.0, 30.0),
-        handler,
-        sel!(deleteLocalContainerImage:),
+        rect(content_x + 154.0, header_y - 72.0, 126.0, 30.0),
+        if image_has_tag {
+            &["More…", "Remove Tag", "Delete Image"]
+        } else {
+            &["More…", "Delete Image"]
+        },
+        0,
         mtm,
     );
     unsafe {
         let _: () = msg_send![&*create, setTag: create_index as isize];
         let _: () = msg_send![&*create, setToolTip:
-            &*NSString::from_str("Create a GUI session from this image")];
-        let _: () = msg_send![&*delete, setTag: delete_index as isize];
-        let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Delete this local image after confirmation")];
+            &*NSString::from_str("Create an application profile from this image")];
+        let _: () = msg_send![&*more, setTarget: handler];
+        let _: () = msg_send![&*more, setAction: sel!(imageMoreAction:)];
+        let _: () = msg_send![&*more, setTag: delete_index as isize];
+        let _: () = msg_send![&*more, setToolTip:
+            &*NSString::from_str("Remove a tag or delete the underlying image after dependency checks")];
     }
 
-    let card_y = header_y - 246.0;
-    add_detail_card(parent, content_x, card_y, width - 84.0, 144.0, mtm);
-    add_detail_row(
+    let (repository, tag) = split_image_reference(&image.reference);
+    let image_id = image_id_from_label(&image.label, &image.reference);
+    let known_tags = image_id
+        .as_deref()
+        .map(|image_id| image_references_for_id(&image.runtime_key, image_id))
+        .filter(|references| !references.is_empty())
+        .unwrap_or_else(|| vec![image.reference.clone()]);
+    let sessions = container_sessions::load_sessions();
+    let referenced_profiles = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            known_tags.contains(&session.image)
+                && runtime_key_matches(&image.runtime_key, &session.runtime)
+        })
+        .map(|(index, session)| (index, session.name.clone()))
+        .collect::<Vec<_>>();
+    let running_instances = referenced_profiles
+        .iter()
+        .filter(|(index, _)| active_session(*index).is_some())
+        .map(|(_, name)| name.clone())
+        .collect::<Vec<_>>();
+    let rows = vec![
+        ("Repository".into(), repository.into()),
+        ("Tag".into(), tag.into()),
+        (
+            "Image ID".into(),
+            image_id.unwrap_or_else(|| "Unknown".into()),
+        ),
+        ("Runtime".into(), image.runtime.clone()),
+        (
+            "Known Tags".into(),
+            if known_tags.is_empty() {
+                "None".into()
+            } else {
+                known_tags.join("\n")
+            },
+        ),
+        (
+            "Applications".into(),
+            if referenced_profiles.is_empty() {
+                "None".into()
+            } else {
+                referenced_profiles
+                    .iter()
+                    .map(|(_, name)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+        ),
+        (
+            "Running".into(),
+            if running_instances.is_empty() {
+                "0 instances".into()
+            } else {
+                format!(
+                    "{}: {}",
+                    format_count(running_instances.len(), "instance"),
+                    running_instances.join(", ")
+                )
+            },
+        ),
+    ];
+    let card_y = add_labeled_rows_card(
         parent,
-        "Runtime",
-        &image.runtime,
-        content_x + 22.0,
-        card_y + 104.0,
-        width - 128.0,
-        mtm,
-    );
-    add_detail_row(
-        parent,
-        "Reference",
-        &image.reference,
-        content_x + 22.0,
-        card_y + 78.0,
-        width - 128.0,
-        mtm,
-    );
-    add_detail_row(
-        parent,
-        "Source row",
-        &image.label,
-        content_x + 22.0,
-        card_y + 52.0,
-        width - 128.0,
+        "Image Details",
+        &rows,
+        content_x,
+        header_y - 112.0,
+        width - 84.0,
         mtm,
     );
 
-    let inspect_y = card_y - 190.0;
+    let inspect_y = card_y - 178.0;
     add_detail_card(parent, content_x, inspect_y, width - 84.0, 158.0, mtm);
     add_label(
         parent,
@@ -7262,9 +10844,14 @@ fn add_volume_detail(
     let delete_index = {
         let mut actions = VOLUME_DELETE_ACTIONS.lock().unwrap();
         let action_index = actions.len();
-        actions.push((volume.runtime_key.clone(), volume.name.clone()));
+        actions.push(VolumeDeleteAction {
+            runtime: volume.runtime_key.clone(),
+            name: volume.name.clone(),
+        });
         action_index
     };
+    let usage = volume_usage(&volume.runtime_key, &volume.name);
+    let metadata = volume_inspect_metadata(&volume.runtime_key, &volume.name, &volume.label);
     let delete = add_button(
         parent,
         "Delete Volume",
@@ -7275,41 +10862,59 @@ fn add_volume_detail(
     );
     unsafe {
         let _: () = msg_send![&*delete, setTag: delete_index as isize];
-        let _: () = msg_send![&*delete, setToolTip:
-            &*NSString::from_str("Delete this volume after confirmation")];
+        let blocked =
+            usage.loading || usage.error.is_some() || !usage.mounted_containers.is_empty();
+        let _: () = msg_send![&*delete, setEnabled: !blocked];
+        let tooltip = if !usage.mounted_containers.is_empty() {
+            format!("Mounted by: {}", usage.mounted_containers.join(", "))
+        } else if usage.loading {
+            "Wait for the volume usage check to finish".into()
+        } else if let Some(error) = usage.error.as_deref() {
+            format!("Usage could not be verified: {error}")
+        } else {
+            "Delete this volume after confirmation".into()
+        };
+        let _: () = msg_send![&*delete, setToolTip: &*NSString::from_str(&tooltip)];
     }
 
-    let card_y = header_y - 220.0;
-    add_detail_card(parent, content_x, card_y, width - 84.0, 118.0, mtm);
-    add_detail_row(
+    let rows = vec![
+        ("Name".into(), volume.name.clone()),
+        ("Runtime".into(), volume.runtime.clone()),
+        ("Type / Driver".into(), metadata.kind),
+        ("Size".into(), metadata.size),
+        ("Created".into(), metadata.created),
+        (
+            "Referenced Profiles".into(),
+            if usage.referenced_profiles.is_empty() {
+                "None".into()
+            } else {
+                usage.referenced_profiles.join(", ")
+            },
+        ),
+        (
+            "Mounted Containers".into(),
+            if usage.loading {
+                "Checking...".into()
+            } else if let Some(error) = usage.error.as_deref() {
+                format!("Unavailable: {error}")
+            } else if usage.mounted_containers.is_empty() {
+                "None".into()
+            } else {
+                usage.mounted_containers.join(", ")
+            },
+        ),
+    ];
+    let card_y = add_labeled_rows_card(
         parent,
-        "Runtime",
-        &volume.runtime,
-        content_x + 22.0,
-        card_y + 78.0,
-        width - 128.0,
-        mtm,
-    );
-    add_detail_row(
-        parent,
-        "Name",
-        &volume.name,
-        content_x + 22.0,
-        card_y + 52.0,
-        width - 128.0,
-        mtm,
-    );
-    add_detail_row(
-        parent,
-        "Source row",
-        &volume.label,
-        content_x + 22.0,
-        card_y + 26.0,
-        width - 128.0,
+        "Volume Details",
+        &rows,
+        content_x,
+        header_y - 112.0,
+        width - 84.0,
         mtm,
     );
 
-    let inspect_y = card_y - 190.0;
+    let inspect_y = card_y - 178.0;
     add_detail_card(parent, content_x, inspect_y, width - 84.0, 158.0, mtm);
     add_label(
         parent,
@@ -7587,33 +11192,6 @@ fn add_detail_card(
     add_card(parent, rect(x, y, width, height), mtm);
 }
 
-fn add_detail_row(
-    parent: &NSView,
-    key: &str,
-    value: &str,
-    x: f64,
-    y: f64,
-    width: f64,
-    mtm: MainThreadMarker,
-) {
-    add_label(
-        parent,
-        key,
-        rect(x, y, 112.0, 18.0),
-        mtm,
-        TextStyle::Caption,
-    );
-    let value_width = (width - 124.0).max(80.0);
-    let value = short_text(value, chars_for_width(value_width, TextStyle::Body));
-    add_label(
-        parent,
-        &value,
-        rect(x + 124.0, y - 1.0, value_width, 20.0),
-        mtm,
-        TextStyle::Body,
-    );
-}
-
 fn add_tab_bar(
     parent: &NSView,
     x: f64,
@@ -7635,7 +11213,7 @@ fn add_tab_bar(
         ),
         mtm,
     );
-    for (index, title) in ["Info", "Logs", "Terminal", "Files"].iter().enumerate() {
+    for (index, title) in ["Overview", "Logs", "Terminal", "Files"].iter().enumerate() {
         let label_width = tab_w - 16.0;
         add_label(
             parent,
@@ -7659,75 +11237,56 @@ fn add_tab_bar(
     }
 }
 
-fn add_runtime_summary(
-    parent: &NSView,
-    x: f64,
-    y: f64,
-    width: f64,
-    compact: bool,
-    mtm: MainThreadMarker,
-) {
+fn add_runtime_summary(parent: &NSView, x: f64, y: f64, width: f64, mtm: MainThreadMarker) {
     let diagnostics = runtime_diagnostics(&[]);
-    *RUNTIME_FPS_LABEL.lock().unwrap() = None;
-    let columns = if compact { 3 } else { diagnostics.len().max(1) };
+    let columns = diagnostics.len().max(1);
     let item_w = width / columns as f64;
     for (i, diagnostic) in diagnostics.iter().enumerate() {
-        let column = if compact { i % columns } else { i };
-        let row_y = if compact && i < columns { y + 48.0 } else { y };
-        let item_x = x + column as f64 * item_w;
+        let item_x = x + i as f64 * item_w;
         add_label(
             parent,
             diagnostic.name,
-            rect(item_x, row_y + 30.0, item_w - 14.0, 16.0),
+            rect(item_x, y + 30.0, item_w - 14.0, 16.0),
             mtm,
             TextStyle::Caption,
         );
-        let value_label = add_label(
+        let state_label = add_label(
             parent,
             &short_text(
                 &diagnostic.state,
                 chars_for_width(item_w - 14.0, TextStyle::Heading),
             ),
-            rect(item_x, row_y + 10.0, item_w - 14.0, 20.0),
+            rect(item_x, y + 10.0, item_w - 14.0, 20.0),
             mtm,
             TextStyle::Heading,
         );
-        if diagnostic.name == "FPS" {
-            *RUNTIME_FPS_LABEL.lock().unwrap() =
-                Some((&*value_label as *const NSTextField) as usize);
+        if diagnostic.name == "Display FPS" {
+            *SUMMARY_FPS_LABEL.lock().unwrap() = Some(Retained::as_ptr(&state_label) as usize);
         }
     }
 }
 
-unsafe fn update_runtime_fps_label() {
-    let Some(label_ptr) = *RUNTIME_FPS_LABEL.lock().unwrap() else {
-        return;
-    };
-    let label = unsafe { &*(label_ptr as *const NSTextField) };
-    let state = performance_diagnostic().state;
-    let _: () = unsafe { msg_send![label, setStringValue: &*NSString::from_str(&state)] };
-}
-
 fn nav_title(index: usize) -> &'static str {
     match index {
+        NAV_RUNNING => "Running",
         NAV_IMAGES => "Images",
         NAV_VOLUMES => "Volumes",
         NAV_DISPLAYS => "Displays",
         NAV_APPLE_CONTAINER => "Apple Container",
-        NAV_DOCKER => "Docker",
+        NAV_DOCKER => "Docker-compatible",
         NAV_ORBSTACK => "OrbStack",
         NAV_ACTIVITY => "Activity",
         NAV_COMMANDS => "Commands",
-        _ => "GUI Sessions",
+        _ => "Applications",
     }
 }
 
 fn detail_empty_message(index: usize) -> &'static str {
     match index {
-        1 => "Select a GUI session to inspect its launch logs and waypipe output.",
-        2 => "Select a GUI session to open an interactive terminal bridge.",
-        3 => "Select a GUI session to inspect files exported from the container.",
-        _ => "Select a GUI session to inspect launch details, runtime, image, and command.",
+        1 => "Select an application profile to inspect its launch logs and Waypipe output.",
+        2 => "Select a running application instance to open an interactive terminal.",
+        3 => "Select an application profile to inspect files exported from its container.",
+        _ => "Select an application profile to inspect its configuration and running instance.",
     }
 }
 
@@ -7762,20 +11321,29 @@ struct RuntimeDiagnostic {
 
 fn runtime_diagnostics(_sessions: &[ContainerSession]) -> Vec<RuntimeDiagnostic> {
     let child_path = build_child_path();
+    let fps = summary_performance_snapshot()
+        .map(|snapshot| display_fps_state(&snapshot))
+        .unwrap_or_else(|| "Waiting".into());
+    let storage = crate::diagnostics::resource_snapshot()
+        .disk_available_bytes
+        .map(|bytes| format!("{:.1} GiB", crate::diagnostics::bytes_to_gib(bytes)))
+        .unwrap_or_else(|| "Unknown".into());
     vec![
-        command_diagnostic("waypipe", "waypipe", &child_path),
         apple_container_diagnostic(&child_path),
         apple_gui_transport_diagnostic(&child_path),
-        performance_diagnostic(),
-        disk_diagnostic(&child_path),
+        RuntimeDiagnostic {
+            name: "Display FPS",
+            state: fps,
+        },
+        RuntimeDiagnostic {
+            name: "Apple Free",
+            state: storage,
+        },
+        RuntimeDiagnostic {
+            name: "Tasks",
+            state: format!("{} active", active_task_count()),
+        },
     ]
-}
-
-fn performance_diagnostic() -> RuntimeDiagnostic {
-    let state = performance_snapshot()
-        .map(|snapshot| format!("{:.1} fps", snapshot.redraw_fps))
-        .unwrap_or_else(|| "Waiting".into());
-    RuntimeDiagnostic { name: "FPS", state }
 }
 
 fn apple_container_diagnostic(child_path: &str) -> RuntimeDiagnostic {
@@ -7817,117 +11385,113 @@ fn apple_gui_transport_diagnostic(child_path: &str) -> RuntimeDiagnostic {
     }
 }
 
-fn command_diagnostic(label: &'static str, command: &str, child_path: &str) -> RuntimeDiagnostic {
-    match find_command_path(command, child_path) {
-        Some(_path) => RuntimeDiagnostic {
-            name: label,
-            state: "Ready".into(),
-        },
-        None => RuntimeDiagnostic {
-            name: label,
-            state: "Missing".into(),
-        },
-    }
-}
-
-fn disk_diagnostic(child_path: &str) -> RuntimeDiagnostic {
-    let _ = child_path;
-    let state = crate::diagnostics::available_disk_bytes()
-        .map(|bytes| format_disk_state(bytes / 1024))
-        .unwrap_or_else(|| "Unknown".into());
-    RuntimeDiagnostic {
-        name: "Disk",
-        state,
-    }
-}
-
 fn apple_container_data_root() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".into());
     format!("{}/Library/Application Support/com.apple.container", home)
-}
-
-fn format_disk_state(available_kib: u64) -> String {
-    let available_gib = available_kib as f64 / 1024.0 / 1024.0;
-    if available_gib < 8.0 {
-        format!("Low {:.1}G free", available_gib)
-    } else {
-        format!("{:.1}G free", available_gib)
-    }
 }
 
 unsafe fn add_session_row(
     parent: &NSView,
     session: &ContainerSession,
     index: usize,
-    active: bool,
+    selected: bool,
     state: Option<SessionState>,
     y: f64,
     width: f64,
     handler: *mut AnyObject,
     mtm: MainThreadMarker,
 ) {
-    let card_w = (width - 24.0).max(260.0);
+    let card_w = (width - 24.0).max(320.0);
     let process_active = active_session(index).is_some();
     let state_label = state
         .as_ref()
-        .map(|state| state.label)
+        .map(|state| session_state_label(&state))
         .unwrap_or(if process_active {
             "Running"
         } else if session_has_apple_transport_block(session) {
             "Blocked"
         } else {
-            "Not launched"
+            "Validating"
         });
     let missing_image = state.as_ref().is_some_and(is_missing_image_state);
     let transport_blocked = session_has_apple_transport_block(session);
     let launch_busy = process_active || session_is_launch_busy(state.as_ref());
-    add_card(parent, rect(12.0, y + 10.0, card_w, 122.0), mtm);
-    if active {
-        add_separator(parent, rect(12.0, y + 10.0, 4.0, 122.0), mtm);
-    }
+    let card_frame = rect(12.0, y + 10.0, card_w, 160.0);
+    add_profile_card(
+        parent,
+        card_frame,
+        selected,
+        runtime_nav(&session.runtime),
+        mtm,
+    );
     add_label(
         parent,
         &session.name,
-        rect(32.0, y + 96.0, card_w - 138.0, 24.0),
+        rect(32.0, y + 136.0, card_w - 174.0, 24.0),
         mtm,
         TextStyle::Heading,
     );
-    add_label(
+    let status = add_label(
         parent,
-        &format!("{} · {}", state_label, runtime_label(&session.runtime)),
-        rect(32.0, y + 70.0, card_w - 138.0, 20.0),
+        state_label,
+        rect(card_w - 132.0, y + 138.0, 112.0, 18.0),
         mtm,
-        TextStyle::Body,
+        TextStyle::Caption,
     );
-    add_label(
-        parent,
-        &short_image_label(&session.image, 42),
-        rect(32.0, y + 46.0, card_w - 138.0, 20.0),
-        mtm,
-        TextStyle::Body,
-    );
+    if let Some(detail) = state.as_ref().map(|state| state.detail.as_str()) {
+        unsafe {
+            let _: () = msg_send![&*status, setToolTip: &*NSString::from_str(detail)];
+        }
+    }
     add_label(
         parent,
         &format!(
-            "{} · display {}",
+            "{} · {}",
             session_display_command(session),
-            session_display_summary(session)
+            session_presentation_summary(session)
         ),
-        rect(32.0, y + 22.0, card_w - 138.0, 20.0),
+        rect(32.0, y + 112.0, card_w - 52.0, 20.0),
+        mtm,
+        TextStyle::Body,
+    );
+    add_label(
+        parent,
+        runtime_label(&session.runtime),
+        rect(32.0, y + 90.0, card_w - 52.0, 18.0),
+        mtm,
+        TextStyle::Caption,
+    );
+    add_label(
+        parent,
+        &short_image_label(&session.image, 54),
+        rect(32.0, y + 68.0, card_w - 52.0, 20.0),
+        mtm,
+        TextStyle::Body,
+    );
+    add_label(
+        parent,
+        if process_active {
+            "1 active instance"
+        } else {
+            "No running instances"
+        },
+        rect(32.0, y + 46.0, card_w - 52.0, 18.0),
         mtm,
         TextStyle::Caption,
     );
     add_hit_button(
         parent,
-        rect(12.0, y + 10.0, card_w - 108.0, 122.0),
+        card_frame,
         index,
         handler,
         sel!(selectContainerSession:),
         mtm,
     );
 
-    let primary_label = if launch_busy {
-        state.as_ref().map(|state| state.label).unwrap_or("Running")
+    let primary_label = if process_active {
+        "Open"
+    } else if launch_busy {
+        state.as_ref().map(session_state_label).unwrap_or("Running")
     } else if transport_blocked {
         "Blocked"
     } else if missing_image {
@@ -7941,7 +11505,9 @@ unsafe fn add_session_row(
     } else {
         "Launch"
     };
-    let primary_selector = if launch_busy || transport_blocked {
+    let primary_selector = if process_active {
+        sel!(selectContainerSession:)
+    } else if launch_busy || transport_blocked {
         sel!(checkContainerSession:)
     } else if missing_image {
         if is_smoke_image_reference(&session.image) {
@@ -7954,8 +11520,10 @@ unsafe fn add_session_row(
     } else {
         sel!(launchContainerSession:)
     };
-    let primary_tooltip = if launch_busy {
-        "This session is already active. Stop it before launching again."
+    let primary_tooltip = if process_active {
+        "Open this application profile and inspect its running instance"
+    } else if launch_busy {
+        "This application is starting or stopping"
     } else if transport_blocked {
         "Apple Container GUI relay is currently unavailable"
     } else if missing_image {
@@ -7967,12 +11535,12 @@ unsafe fn add_session_row(
             "Pull the missing image before launching"
         }
     } else {
-        "Start this session through Cocoa-Way's compositor event loop"
+        "Launch an application instance from this saved profile"
     };
     let primary = add_button(
         parent,
         primary_label,
-        rect(card_w - 94.0, y + 78.0, 82.0, 30.0),
+        rect(32.0, y + 14.0, 82.0, 28.0),
         handler,
         primary_selector,
         mtm,
@@ -7981,39 +11549,66 @@ unsafe fn add_session_row(
         let _: () = msg_send![&*primary, setTag: index as isize];
         let _: () = msg_send![&*primary, setToolTip:
             &*NSString::from_str(primary_tooltip)];
-        if launch_busy || transport_blocked {
+        if !process_active && (launch_busy || transport_blocked) {
             let _: () = msg_send![&*primary, setEnabled: false];
         }
     }
 
-    let check = add_button(
-        parent,
-        "Check",
-        rect(card_w - 94.0, y + 42.0, 82.0, 30.0),
-        handler,
-        sel!(checkContainerSession:),
-        mtm,
-    );
-    unsafe {
-        let _: () = msg_send![&*check, setTag: index as isize];
-        let _: () = msg_send![&*check, setToolTip:
-            &*NSString::from_str("Run preflight checks without launching the session")];
-    }
-
     if process_active || matches!(state_label, "Running" | "Stopping") {
+        let force_stop = state
+            .as_ref()
+            .is_some_and(|state| state.force_stop_available);
         let stop = add_button(
             parent,
-            "Stop",
-            rect(card_w - 94.0, y + 6.0, 82.0, 30.0),
+            if force_stop {
+                "Force Stop"
+            } else {
+                "Stop Instance"
+            },
+            rect(
+                124.0,
+                y + 14.0,
+                if force_stop { 100.0 } else { 112.0 },
+                28.0,
+            ),
             handler,
-            sel!(stopContainerSession:),
+            if force_stop {
+                sel!(forceStopContainerSession:)
+            } else {
+                sel!(stopContainerSession:)
+            },
             mtm,
         );
         unsafe {
             let _: () = msg_send![&*stop, setTag: index as isize];
             let _: () = msg_send![&*stop, setToolTip:
-                &*NSString::from_str("Stop the tracked container and waypipe processes")];
+            &*NSString::from_str(if force_stop {
+                "Immediately terminate an application that did not stop gracefully"
+            } else {
+                "Ask the application to exit gracefully"
+            })];
         }
+    }
+
+    let more = add_popup(
+        parent,
+        rect(card_w - 58.0, y + 14.0, 46.0, 28.0),
+        &[
+            "…",
+            "Duplicate Profile",
+            "Export Profile",
+            "View Raw Configuration",
+            "Delete Profile",
+        ],
+        0,
+        mtm,
+    );
+    unsafe {
+        let _: () = msg_send![&*more, setTarget: handler];
+        let _: () = msg_send![&*more, setAction: sel!(applicationProfileMoreAction:)];
+        let _: () = msg_send![&*more, setTag: index as isize];
+        let _: () = msg_send![&*more, setToolTip:
+            &*NSString::from_str("More profile actions")];
     }
 }
 
@@ -8080,22 +11675,11 @@ fn session_display_summary(session: &ContainerSession) -> String {
     }
 }
 
-fn display_occupancy_summary(index: usize, session: &ContainerSession) -> String {
-    match active_session(index) {
-        Some(active) => {
-            let worker = active
-                .display_pid
-                .map(|pid| format!("; display pid {}", pid))
-                .unwrap_or_default();
-            format!(
-                "using {} display; waypipe pid {}{}",
-                active.display_slot, active.waypipe_pid, worker
-            )
-        }
-        None => format!(
-            "requested {} display; not running",
-            session_display_target(session)
-        ),
+fn session_presentation_summary(session: &ContainerSession) -> &'static str {
+    if session.presentation_mode().is_rootless() {
+        "Rootless"
+    } else {
+        "Desktop"
     }
 }
 
@@ -8206,14 +11790,6 @@ fn request_selected_runtime_container_details() {
         runtime: selected.runtime,
         name: selected.name,
     });
-}
-
-fn list_or_empty(values: &[String]) -> String {
-    if values.is_empty() {
-        "none".into()
-    } else {
-        values.join(", ")
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -8413,6 +11989,42 @@ fn add_card(parent: &NSView, frame: NSRect, mtm: MainThreadMarker) {
     }
 }
 
+fn add_profile_card(
+    parent: &NSView,
+    frame: NSRect,
+    selected: bool,
+    runtime_nav: usize,
+    mtm: MainThreadMarker,
+) {
+    if !selected {
+        add_card(parent, frame, mtm);
+        return;
+    }
+    unsafe {
+        let card = NSBox::initWithFrame(mtm.alloc::<NSBox>(), frame);
+        card.setBoxType(NSBoxType::NSBoxCustom);
+        card.setTitle(&NSString::from_str(""));
+        card.setTransparent(false);
+        card.setCornerRadius(10.0);
+        card.setBorderWidth(1.5);
+        let accent = NSColor::controlAccentColor();
+        card.setFillColor(&accent.colorWithAlphaComponent(0.09));
+        card.setBorderColor(&accent.colorWithAlphaComponent(0.75));
+        parent.addSubview(&card);
+    }
+    add_runtime_accent(
+        parent,
+        runtime_nav,
+        rect(
+            frame.origin.x,
+            frame.origin.y + 10.0,
+            4.0,
+            frame.size.height - 20.0,
+        ),
+        mtm,
+    );
+}
+
 fn add_runtime_accent(parent: &NSView, nav: usize, frame: NSRect, mtm: MainThreadMarker) {
     unsafe {
         let accent = NSBox::initWithFrame(mtm.alloc::<NSBox>(), frame);
@@ -8555,10 +12167,31 @@ mod tests {
     }
 
     #[test]
+    fn long_session_detail_values_reserve_a_second_line() {
+        assert_eq!(session_detail_row_height("Running", 240.0), 26.0);
+        assert_eq!(
+            session_detail_row_height(
+                "Tracked by Cocoa-Way with a long transport and display occupancy summary",
+                160.0,
+            ),
+            42.0
+        );
+    }
+
+    #[test]
     fn desktop_sessions_receive_larger_apple_container_limits() {
         assert_eq!(
             default_gui_runtime_args("container", Some("niri")),
             ["--memory", "4G", "--shm-size", "1G", "--cpus", "4"]
+        );
+    }
+
+    #[test]
+    fn untracked_runtime_instance_does_not_disable_profile_launch() {
+        assert_eq!(checked_instance_status(true, false), None);
+        assert_eq!(
+            checked_instance_status(true, true),
+            Some(InstanceStatus::Running)
         );
     }
 
@@ -8586,10 +12219,94 @@ mod tests {
     }
 
     #[test]
+    fn image_reference_split_preserves_registry_ports() {
+        assert_eq!(
+            split_image_reference("localhost:5000/team/desktop:v2"),
+            ("localhost:5000/team/desktop", "v2")
+        );
+        assert_eq!(split_image_reference("ubuntu:24.04"), ("ubuntu", "24.04"));
+        assert_eq!(
+            split_image_reference("sha256:deadbeef"),
+            ("sha256", "deadbeef")
+        );
+        assert_eq!(
+            split_image_reference("untagged-image"),
+            ("untagged-image", "<none>")
+        );
+    }
+
+    #[test]
+    fn image_id_is_read_from_inventory_metadata() {
+        assert_eq!(
+            image_id_from_label("ubuntu:24.04    deadbeef    78MB", "ubuntu:24.04"),
+            Some("deadbeef".into())
+        );
+        assert_eq!(image_id_from_label("ubuntu:24.04", "ubuntu:24.04"), None);
+    }
+
+    #[test]
+    fn runtime_arguments_support_split_and_equals_values() {
+        let arguments = vec![
+            "--memory".into(),
+            "4G".into(),
+            "--cpus=4".into(),
+            "--read-only".into(),
+        ];
+        assert_eq!(runtime_arg_value(&arguments, "--memory"), Some("4G".into()));
+        assert_eq!(runtime_arg_value(&arguments, "--cpus"), Some("4".into()));
+        assert_eq!(
+            format_runtime_arguments(&arguments),
+            "--memory 4G\n--cpus=4\n--read-only"
+        );
+    }
+
+    #[test]
     fn docker_volume_inventory_keeps_name_and_driver() {
         let row = parse_volume_line("project-cache\tlocal").unwrap();
         assert_eq!(row.name.as_deref(), Some("project-cache"));
         assert!(row.label.contains("local"));
+    }
+
+    #[test]
+    fn volume_mount_matching_accepts_runtime_mount_syntax() {
+        assert!(mount_references_volume(
+            "type=volume,source=project-data,target=/workspace",
+            "project-data"
+        ));
+        assert!(mount_references_volume(
+            "project-data:/workspace",
+            "project-data"
+        ));
+        assert!(!mount_references_volume(
+            "type=bind,source=/tmp/project-data,target=/workspace",
+            "project-data"
+        ));
+    }
+
+    #[test]
+    fn apple_container_volume_usage_reads_mount_sources() {
+        let json = r#"[
+            {"id":"desktop","configuration":{"mounts":[{"source":"project-data","type":{"volume":{}}}]}},
+            {"id":"other","configuration":{"mounts":[]}}
+        ]"#;
+        assert_eq!(
+            parse_apple_volume_mounts(json, "project-data").unwrap(),
+            ["desktop"]
+        );
+    }
+
+    #[test]
+    fn volume_inspect_metadata_supports_docker_and_apple_fields() {
+        let docker = br#"[{"Driver":"local","CreatedAt":"2026-07-16T12:00:00Z"}]"#;
+        let docker = parse_volume_inspect_metadata(docker, "Managed volume").unwrap();
+        assert_eq!(docker.kind, "local");
+        assert_eq!(docker.created, "2026-07-16T12:00:00Z");
+
+        let apple =
+            br#"[{"type":"ext4","sizeInBytes":1073741824,"creationDate":"2026-07-16T12:00:00Z"}]"#;
+        let apple = parse_volume_inspect_metadata(apple, "Managed volume").unwrap();
+        assert_eq!(apple.kind, "ext4");
+        assert_eq!(apple.size, "1.0 GiB");
     }
 
     #[test]
@@ -8601,6 +12318,20 @@ mod tests {
         assert_eq!(row.name.as_deref(), Some("orbstack"));
         assert!(row.current);
         assert!(row.label.starts_with("* orbstack"));
+    }
+
+    #[test]
+    fn orbstack_machine_inventory_parses_json_and_state() {
+        let rows = parse_orbstack_machine_rows(
+            r#"[{"name":"arch","image":{"distro":"archlinux","version":"current","arch":"arm64"},"state":"stopped"},{"name":"ubuntu","image":{"distro":"ubuntu","version":"24.04","arch":"arm64"},"state":"running"}]"#,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name.as_deref(), Some("arch"));
+        assert!(rows[0].detail.contains("archlinux current"));
+        assert!(!rows[0].running);
+        assert_eq!(rows[1].name.as_deref(), Some("ubuntu"));
+        assert!(rows[1].running);
     }
 
     #[test]
@@ -8621,5 +12352,34 @@ mod tests {
         assert!(version_at_least("2.0.0", (1, 1, 0)));
         assert!(!version_at_least("1.0.9", (1, 1, 0)));
         assert!(!version_at_least("unknown", (1, 0, 0)));
+    }
+
+    #[test]
+    fn slow_ui_commands_complete_in_the_background() {
+        invalidate_ui_command_cache();
+        let started = Instant::now();
+        let first = run_ui_command(
+            std::path::Path::new("/bin/sh"),
+            "/usr/bin:/bin",
+            &["-c", "sleep 0.15; printf ready"],
+            Duration::from_secs(1),
+        );
+        assert_eq!(first.unwrap_err(), UI_COMMAND_LOADING);
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let output = (0..20)
+            .find_map(|_| {
+                std::thread::sleep(Duration::from_millis(25));
+                run_ui_command(
+                    std::path::Path::new("/bin/sh"),
+                    "/usr/bin:/bin",
+                    &["-c", "sleep 0.15; printf ready"],
+                    Duration::from_secs(1),
+                )
+                .ok()
+            })
+            .expect("background command should populate the UI cache");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
     }
 }

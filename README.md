@@ -2,212 +2,231 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/J-x-Z/cocoa-way/releases)
 [![Build Status](https://github.com/J-x-Z/cocoa-way/actions/workflows/release.yml/badge.svg)](https://github.com/J-x-Z/cocoa-way/actions)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
-[![macOS](https://img.shields.io/badge/macOS-11.0+-black.svg)](https://www.apple.com/macos/)
+[![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)](https://www.rust-lang.org/)
+[![macOS](https://img.shields.io/badge/macOS-native-black.svg)](https://www.apple.com/macos/)
 [![Mentioned in Awesome Rust](https://awesome.re/mentioned-badge.svg)](https://github.com/rust-unofficial/awesome-rust)
 [![Awesome Mac](https://img.shields.io/badge/Awesome-macOS-black?logo=apple)](https://github.com/jaywcjlove/awesome-mac)
 
-**Native macOS Wayland compositor for running Linux apps seamlessly**
+**A native macOS Wayland compositor and Linux application control plane.**
 
-[Demo Video](#-demo-video) • [Install](#-installation) • [Quick Start](#-quick-start) • [Architecture](#-architecture)
+[Demo](#demo) | [Install](#installation) | [Quick start](#quick-start) | [Container mode](#container-mode) | [Architecture](#architecture)
 
 </div>
 
 ---
 
-## Demo Video
+## What is Cocoa-Way?
 
-[![Demo Video](https://img.youtube.com/vi/VS3vQp5i8YQ/0.jpg)](https://youtu.be/VS3vQp5i8YQ)
+Cocoa-Way receives the Wayland protocol on macOS and presents Linux applications through a Metal renderer. It can connect to an existing Linux machine with Waypipe or manage local GUI applications through Apple Container, Docker, and OrbStack.
 
-> *True protocol portability: Cocoa-Way rendering Linux apps from SSH hosts, Docker, OrbStack, and Apple Container.*
+Version 2.0 models the product around three explicit objects:
 
-## Features
+- **Application profile**: saved image, command, runtime, presentation, audio, mounts, and environment settings.
+- **Application instance**: one running profile with its own process, logs, transport, and lifecycle state.
+- **Display**: the default compositor window or an isolated display worker assigned to an instance.
 
-| Feature                               | Description                                               |
-| ------------------------------------- | --------------------------------------------------------- |
-| **Native macOS**                | Metal rendering                                           |
-| **Compositor Zero VM Overhead** | Direct Wayland protocol via socket, no virtualization     |
-| **HiDPI Ready**                 | Optimized for Retina displays with proper scaling         |
-| **Polished UI**                 | Server-side decorations with shadows and focus indicators |
-| **Hardware Accelerated**        | Efficient Metal rendering pipeline                       |
+This keeps classic SSH and local-socket workflows available while making Apple Container a first-class runtime.
+
+## Demo
+
+[![Cocoa-Way demo](https://img.youtube.com/vi/MOZRRifSazY/0.jpg)](https://youtu.be/MOZRRifSazY)
+
+## Highlights
+
+| Area | Cocoa-Way 2.0 |
+| --- | --- |
+| Rendering | Native Metal renderer with Retina scaling and damage-aware SHM uploads |
+| Presentation | Desktop mode for compositors and rootless mode for individual xdg-shell applications |
+| Runtimes | Apple Container, Docker-compatible engines, OrbStack, SSH, and local Waypipe sockets |
+| Displays | Automatic assignment, named displays, and isolated workers for concurrent applications |
+| Transport | Apple Container Transport V2 over `--publish-socket`, with a compatibility relay fallback |
+| Integration | Bidirectional text clipboard, low-latency CoreAudio forwarding, keyboard, pointer, and gestures |
+| Control plane | Native runtime panels, `cocoa-wayctl --json`, diagnostics, tasks, logs, and resource warnings |
+| Automation | Optional read-only MCP server and onboarding skill; launch, stop, and deletion remain explicit user actions |
 
 ## Installation
 
-### Homebrew (Recommended)
+### Homebrew
 
 ```bash
 brew tap J-x-Z/tap
 brew install cocoa-way waypipe-darwin
 ```
 
-### Download Binary
+### Release archive
 
-Download the latest `.dmg` or `.zip` from [Releases](https://github.com/J-x-Z/cocoa-way/releases).
+Download the current `.dmg` or `.zip` from [GitHub Releases](https://github.com/J-x-Z/cocoa-way/releases).
 
-### Build from Source
+### Build from source
 
 ```bash
-# Install dependencies
 brew install libxkbcommon pixman pkg-config
-
-# Clone and build
 git clone https://github.com/J-x-Z/cocoa-way.git
 cd cocoa-way
 cargo build --release
 ```
 
-## Quick Start
+`waypipe-darwin` is required on the Mac for transported applications. The Linux host or GUI-ready container image also needs a compatible Waypipe server.
 
-> ⚠️ **Required:** You must install [waypipe-darwin](https://github.com/J-x-Z/waypipe-darwin) to connect Linux apps.
->
-> ```bash
-> brew tap J-x-Z/tap && brew install waypipe-darwin
-> ```
+## Quick start
 
-1. **Start the compositor:**
+Start Cocoa-Way:
 
-   ```bash
-   cocoa-way
-   ```
-2. **Connect Linux apps via SSH:**
+```bash
+cocoa-way
+```
 
-   ```bash
-   ./run_waypipe.sh ssh user@linux-host firefox
-   ```
+Connect to an SSH host with the compatibility script:
 
-3. **Or use `Connections > Connect to Machine...` in the macOS menu:**
+```bash
+./run_waypipe.sh ssh user@linux-host firefox
+```
 
-   Enter `user@host`, the application, and an optional display slot. Enable **Save this connection for later** to add it to the Connections menu immediately. Saved entries are written to `~/.config/cocoa-way/connections.toml` with private file permissions; passwords are never stored.
+The script also supports local Waypipe/socket workflows and remains independent of Container Mode. The same connection can be created from **Connections > Connect to Machine...**. Saved entries appear in the Connections menu and are stored in `~/.config/cocoa-way/connections.toml`; passwords are never stored.
 
-4. **Add persistent container sessions in `~/.config/cocoa-way/container-sessions.toml`:**
+For a local Apple Container application:
 
-   ```toml
-   [[session]]
-   name = "Niri Desktop (Apple Container)"
-   runtime = "container"
-   image = "localhost/cocoa-way-niri:latest"
-   profile = "niri"
-   command = "niri"
-   ```
+1. Open **Container > Applications**.
+2. Use **Images** to pull/import an OCI image or build the bundled GUI-ready example.
+3. Create an application, choose Desktop or Rootless presentation, and leave Display on Auto unless a stable slot is required.
+4. Run **Check**, then **Launch**.
+5. Inspect instance status, logs, terminal, files, audio, display assignment, and resource diagnostics in the same panel.
 
-   Then use the Container menu inside Cocoa-Way to launch the session.
+## Presentation modes
 
-### Container Runtimes
+### Desktop
 
-Cocoa-Way has two control modes: Classic connections for SSH / local sockets, and Container Mode for local Linux GUI sessions managed by Cocoa-Way.
+Desktop presentation maps Linux windows into one Cocoa-Way compositor window. Use it for nested compositors such as niri or Hyprland and for workflows that intentionally share one Linux desktop surface.
 
-- `runtime = "container"` uses Apple's official [`container`](https://github.com/apple/container) CLI. Apple documents it as requiring Apple silicon and macOS 26+, and you must start its background service first with `container system start`.
-- `runtime = "docker"` works with Docker Desktop and compatible CLIs.
-- `runtime = "orb"` or `runtime = "orbstack"` works with OrbStack.
+### Rootless
 
-For Apple Container, Cocoa-Way prefers Transport V2: a multiplexed waypipe relay carried by `container run --publish-socket`. If that capability is unavailable or fails during startup, Cocoa-Way falls back to its stdio compatibility relay automatically. For Docker and OrbStack, Cocoa-Way bind-mounts the host socket directory into the container and connects over that local socket.
+Rootless presentation maps each xdg-toplevel to a separate native macOS window. Native move, resize, minimize, maximize, fullscreen, title updates, popups, and per-surface input are forwarded to the Linux application.
 
-Container Mode can assign `display = "auto"`, `display = "default"`, or a stable named display to a session. `auto` uses the main compositor window when it is free and creates a dedicated Cocoa-Way display window when another GUI session already occupies it.
+Use Rootless for ordinary Wayland applications such as Foot or Firefox. A desktop compositor is not a rootless application and should remain in Desktop mode.
 
-The Apple Container, Docker, and OrbStack pages expose runtime status, container lifecycle controls, logs, resource usage, and terminal access. Stopping OrbStack pauses Docker-compatible inventory polling so Cocoa-Way does not wake the service again while it is intentionally stopped.
+## Container mode
 
-### Local Control
+### Runtime support
 
-The compositor exposes a local Unix-socket control API while it is running. `cocoa-wayctl` provides JSON-friendly status and lifecycle commands without bypassing the GUI's safety checks:
+- `runtime = "container"` uses Apple's official `container` CLI. Apple Container itself requires supported Apple silicon and macOS versions; Cocoa-Way reports the installed version and missing capabilities in the Apple Container panel.
+- `runtime = "docker"` uses the active Docker-compatible context.
+- `runtime = "orb"` or `runtime = "orbstack"` uses OrbStack-compatible lifecycle and inventory controls.
+
+The runtime panels expose system state, machines or contexts, containers, images, logs, terminal access, CPU/memory statistics, and guarded lifecycle actions. Cocoa-Way does not require Docker or OrbStack for Apple Container sessions.
+
+### Apple Container transport
+
+On Apple Container 1.0 and newer, Cocoa-Way prefers Transport V2. It publishes a host Unix socket into the container, multiplexes Waypipe streams over that channel, and ties the relay lifetime to the application instance. If socket publishing is unavailable or fails during startup, Cocoa-Way can fall back to the older stdio relay.
+
+Clipboard and audio use dedicated local relays. If the Mac uses a loopback HTTP proxy, Cocoa-Way can expose that proxy to the Apple Container subnet without changing global network settings.
+
+### Application configuration
+
+The GUI writes profiles to `~/.config/cocoa-way/container-sessions.toml`. A representative profile is:
+
+```toml
+[[session]]
+name = "Niri Desktop"
+runtime = "container"
+image = "localhost/cocoa-way-niri:latest"
+profile = "niri"
+command = "niri"
+presentation = "desktop"
+display = "auto"
+audio = true
+runtime_args = ["--memory", "4G", "--cpus", "4"]
+```
+
+`display = "auto"` uses the built-in display when it is free and allocates an isolated display when necessary. `display = "default"` requires the built-in display. Any other stable name selects a dedicated display slot.
+
+## Local control and MCP
+
+While Cocoa-Way is running it exposes a private Unix-socket control API. `cocoa-wayctl` uses the same validation and event-loop paths as the GUI:
 
 ```bash
 cocoa-wayctl --json status
-cocoa-wayctl sessions
-cocoa-wayctl launch "Niri Desktop (Apple Container)"
+cocoa-wayctl --json applications
+cocoa-wayctl --json displays
+cocoa-wayctl diagnostics "Niri Desktop"
+cocoa-wayctl launch "Niri Desktop"
+cocoa-wayctl stop "Niri Desktop"
 ```
 
-`cocoa-way-mcp` is an optional, local stdio adapter over the same API. Its MCP tools are read-only by design: status, sessions, displays, images, and recent logs. Launch, stop, and destructive resource operations are not exposed to AI clients.
+`cocoa-way-mcp` is an optional local stdio adapter. Its tools can inspect the environment, suggest trusted image paths, generate reviewable application/connection templates, collect diagnostics, and prepare issue reports. MCP tools are read-only by design; they cannot silently launch applications or delete containers, images, or volumes.
+
+The bundled `skills/cocoa-way-onboarding` workflow guides new users through image selection and profile creation without replacing explicit GUI confirmation.
 
 ## Architecture
 
 ```mermaid
 graph LR
     subgraph macOS
-        CW[Cocoa-Way<br/>Compositor]
-        WP1[waypipe<br/>client]
+        UI[Applications and runtime UI]
+        API[cocoa-wayctl and MCP]
+        CW[Cocoa-Way compositor]
+        Metal[Metal renderer]
+        Audio[CoreAudio]
     end
-  
-    subgraph Linux VM/Container
-        WP2[waypipe<br/>server]
-        APP[Linux App<br/>Firefox, etc]
+
+    subgraph Linux
+        App[Wayland application]
+        WPServer[Waypipe server]
+        Helpers[Clipboard and audio relays]
     end
-  
-    APP -->|Wayland Protocol| WP2
-    WP2 <-->|SSH/Socket| WP1
-    WP1 -->|Wayland Protocol| CW
-    CW -->|Metal| Display[macOS Display]
+
+    UI --> CW
+    API --> CW
+    App --> WPServer
+    WPServer <-->|SSH, Unix socket, or Transport V2| CW
+    Helpers <-->|local relay sockets| CW
+    CW --> Metal
+    CW --> Audio
 ```
 
-## Comparison
+Dedicated displays run as isolated Cocoa-Way worker processes. A rootless worker may own several native application windows while retaining one runtime/display assignment. Worker telemetry is published back to the control plane without forcing the GUI to redraw continuously.
 
-| Solution            | Latency | HiDPI        | Native Integration | Setup Complexity |
-| ------------------- | ------- | ------------ | ------------------ | ---------------- |
-| **Cocoa-Way** | ⚡ Low  | ✅           | ✅ Native windows  | 🟢 Easy          |
-| XQuartz             | 🐢 High | ⚠️ Partial | ⚠️ X11 quirks    | 🟡 Medium        |
-| VNC                 | 🐢 High | ❌           | ❌ Full screen     | 🟡 Medium        |
-| VM GUI              | 🐢 High | ⚠️ Partial | ❌ Separate window | 🔴 Complex       |
+## Diagnostics and expected behavior
+
+- A static display reports `0.0 fps - idle`; Cocoa-Way renders on demand rather than polling at a fixed frame rate.
+- Apple Container does not currently provide guest GPU passthrough to Cocoa-Way. Linux applications may render with Mesa/CPU before their SHM buffers are uploaded to Metal on macOS.
+- Rootless mode targets native Wayland xdg-shell clients. X11 applications still require an Xwayland environment inside Linux, and nested desktop compositors should use Desktop mode.
+- Registry images are not automatically GUI-ready. They need Waypipe and the requested application; clipboard and audio require the Cocoa-Way helper binaries.
+
+Use the GUI diagnostics page or:
+
+```bash
+cocoa-wayctl --json diagnostics "Application Name"
+cocoa-wayctl --json logs "Application Name"
+```
+
+For classic SSH socket conflicts, `run_waypipe.sh` adds `StreamLocalBindUnlink=yes`. The equivalent manual command is:
+
+```bash
+waypipe ssh -o StreamLocalBindUnlink=yes user@host application
+```
 
 ## Roadmap
 
-- [X] macOS backend (METAL)
-- [X] Waypipe integration
-- [X] HiDPI scaling
-- [X] winit update
-- [ ] Multi-monitor support
-- [X] Clipboard sync
+- Continue refining GUI behavior and improving Cocoa-Way's responsiveness and runtime efficiency.
+- Continue closing the remaining integration gaps toward a WSLg-like experience for Linux applications on macOS.
 
-## next step
-new gui
-<img width="1164" height="779" alt="image" src="https://github.com/user-attachments/assets/f4c854eb-d828-4a09-baa6-aeed7f02e108" />
-1.1.0 soon
-
-
-
-## Troubleshooting
-
-<details>
-<summary><b>SSH: "remote port forwarding failed"</b></summary>
-
-A stale socket file exists on the remote host. Our `run_waypipe.sh` script handles this automatically with `-o StreamLocalBindUnlink=yes`.
-
-If running manually:
+## Development
 
 ```bash
-waypipe ssh -o StreamLocalBindUnlink=yes user@host ...
+cargo check --release --all-targets
+cargo test --release --all-targets
+cargo build --release
 ```
 
-</details>
-
-<details>
-<summary><b>Apple Container support checklist</b></summary>
-
-```bash
-container system start
-container run --rm -it ubuntu:24.04 /bin/bash
-```
-
-If Cocoa-Way cannot launch a configured Apple Container connection:
-
-- Verify the `container` CLI is installed and available in `/usr/local/bin/container` or your `PATH`.
-- Make sure the image contains `waypipe` and the app you configured in `app = "..."`.
-- On first run, try a shell as the app command to confirm the image itself starts cleanly.
-
-</details>
-
-<details>
-<summary><b>Can Cocoa-Way run local X11 apps directly?</b></summary>
-
-Not yet. Cocoa-Way is focused on Wayland clients transported over waypipe. Running same-machine X11 apps as a full XQuartz replacement is still an open gap.
-
-</details>
+The repository vendors the Smithay Universal integration used by Cocoa-Way. `waypipe-darwin` remains a separately maintained dependency so its Darwin transport fixes can be tested and released independently.
 
 ## Contributing
 
-Contributions welcome! Please open an issue first to discuss major changes.
+Bug reports should include the application profile, presentation mode, runtime, Cocoa-Way diagnostics, and the relevant launch log. Please discuss large architectural changes in an issue before opening a pull request.
 
 ## License
 
-[GPL-3.0](LICENSE) - Copyright (c) 2024-2025 J-x-Z
+[GPL-3.0](LICENSE) - Copyright (c) 2024-2026 J-x-Z

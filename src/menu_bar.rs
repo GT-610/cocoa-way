@@ -81,6 +81,11 @@ declare_class!(
             crate::container_mode::show(tx, mtm);
         }
 
+        #[method(showDefaultDisplay:)]
+        fn show_default_display(&self, _sender: &AnyObject) {
+            send(CompositorMessage::ShowDefaultDisplay);
+        }
+
         #[method(startContainerSession:)]
         fn start_container_session(&self, sender: &AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
@@ -460,6 +465,15 @@ pub fn setup_menu(
         // ── 4. View menu ──────────────────────────────────────────────────────
         let view_item = label_item("View", mtm);
         let view_menu = NSMenu::initWithTitle(mtm.alloc::<NSMenu>(), &NSString::from_str("View"));
+        let show_display = NSMenuItem::initWithTitle_action_keyEquivalent(
+            mtm.alloc::<NSMenuItem>(),
+            &NSString::from_str("Show Default Display"),
+            Some(sel!(showDefaultDisplay:)),
+            &NSString::from_str("1"),
+        );
+        let _: () = msg_send![&*show_display, setTarget: &*handler];
+        view_menu.addItem(&show_display);
+        view_menu.addItem(&NSMenuItem::separatorItem(mtm));
         let hidpi = NSMenuItem::initWithTitle_action_keyEquivalent(
             mtm.alloc::<NSMenuItem>(),
             &NSString::from_str("HiDPI Display"),

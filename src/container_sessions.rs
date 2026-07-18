@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::network::{HostProxyBridge, has_proxy_environment};
 use crate::runtime_paths::{build_child_path, resolve_command_path, shell_single_quote};
 
 #[derive(Debug, Clone, Deserialize)]
@@ -18,6 +19,7 @@ pub struct ContainerSession {
     #[serde(default = "default_runtime")]
     pub runtime: String,
     pub display: Option<String>,
+    pub presentation: Option<String>,
     pub profile: Option<String>,
     pub app: Option<String>,
     pub command: Option<String>,
@@ -26,6 +28,8 @@ pub struct ContainerSession {
     pub waypipe_path: Option<String>,
     pub waypipe_compress: Option<String>,
     pub waypipe_threads: Option<usize>,
+    #[serde(default = "default_audio")]
+    pub audio: bool,
     #[serde(default)]
     pub runtime_args: Vec<String>,
     #[serde(default)]
@@ -60,6 +64,7 @@ pub struct LaunchReport {
     pub container_name: String,
     pub host_socket: String,
     pub container_socket: String,
+    pub audio_host_socket: Option<String>,
     pub command: String,
 }
 
@@ -224,6 +229,9 @@ const RELAY_ENV_LIST_ENV: &str = "COCOA_WAY_RELAY_ENV";
 const RELAY_MOUNTS_ENV: &str = "COCOA_WAY_RELAY_MOUNTS";
 const RELAY_RUNTIME_ARGS_ENV: &str = "COCOA_WAY_RELAY_RUNTIME_ARGS";
 const RELAY_TRANSPORT_ENV: &str = "COCOA_WAY_APPLE_TRANSPORT";
+const RELAY_AUDIO_ENV: &str = "COCOA_WAY_RELAY_AUDIO";
+const RELAY_AUDIO_HOST_ENV: &str = "COCOA_WAY_RELAY_AUDIO_HOST";
+const GUEST_AUDIO_SOCKET_ENV: &str = "COCOA_WAY_AUDIO_SOCKET";
 
 pub fn should_run_container_relay() -> bool {
     std::env::var_os(RELAY_ENV).is_some()
@@ -255,8 +263,37 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
         .unwrap_or_else(|_| "auto".into())
         .to_ascii_lowercase();
     let publish_supported = apple_publish_socket_supported(&container, &child_path);
+    let mut environment = relay_env_list(RELAY_ENV_LIST_ENV);
+    let proxy_bridge = if has_proxy_environment(&environment) {
+        None
+    } else {
+        match HostProxyBridge::start(&container, &child_path) {
+            Ok(Some(bridge)) => {
+                environment.extend(bridge.container_environment());
+                eprintln!(
+                    "cocoa-way network: forwarding the host loopback proxy to Apple Container"
+                );
+                Some(bridge)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!(
+                    "cocoa-way network: host proxy bridge unavailable: {}",
+                    error
+                );
+                None
+            }
+        }
+    };
     if preference != "stdio" && publish_supported {
-        match run_publish_socket_relay(&relay, &container, &child_path, &image, &container_name) {
+        match run_publish_socket_relay(
+            &relay,
+            &container,
+            &child_path,
+            &image,
+            &container_name,
+            &environment,
+        ) {
             Ok(()) => return Ok(()),
             Err(PublishRelayError::Active(error)) => return Err(error),
             Err(PublishRelayError::Startup(error)) => {
@@ -276,7 +313,16 @@ fn run_container_relay(args: Vec<String>) -> Result<(), String> {
         eprintln!("cocoa-way transport v2 is unavailable; falling back to stdio relay");
     }
 
-    run_stdio_relay(&relay, &container, &child_path, &image, &container_name)
+    let result = run_stdio_relay(
+        &relay,
+        &container,
+        &child_path,
+        &image,
+        &container_name,
+        &environment,
+    );
+    drop(proxy_bridge);
+    result
 }
 
 fn run_stdio_relay(
@@ -285,6 +331,7 @@ fn run_stdio_relay(
     child_path: &str,
     image: &str,
     container_name: &str,
+    environment: &[String],
 ) -> Result<(), String> {
     eprintln!("cocoa-way container relay: using stdio compatibility transport");
 
@@ -300,7 +347,7 @@ fn run_stdio_relay(
         .arg(container_name)
         .arg("--env")
         .arg(format!("XDG_RUNTIME_DIR={}", default_guest_runtime_dir()));
-    for env in relay_env_list(RELAY_ENV_LIST_ENV) {
+    for env in environment {
         if !env.starts_with("XDG_RUNTIME_DIR=") {
             cmd.arg("--env").arg(env);
         }
@@ -354,11 +401,27 @@ fn run_publish_socket_relay(
     child_path: &str,
     image: &str,
     container_name: &str,
+    environment: &[String],
 ) -> Result<(), PublishRelayError> {
     let host_transport =
         relay_transport_host_socket(&relay.local_socket).map_err(PublishRelayError::Startup)?;
     let guest_transport = format!("/tmp/cocoa-way/transport-v2-{}.sock", std::process::id());
+    let audio_enabled = std::env::var_os(RELAY_AUDIO_ENV).is_some();
+    let host_audio = if audio_enabled {
+        match std::env::var(RELAY_AUDIO_HOST_ENV) {
+            Ok(path) if !path.trim().is_empty() => Some(path),
+            _ => Some(
+                relay_audio_host_socket(&relay.local_socket).map_err(PublishRelayError::Startup)?,
+            ),
+        }
+    } else {
+        None
+    };
+    let guest_audio = format!("/tmp/cocoa-way/audio-{}.sock", std::process::id());
     let _ = std::fs::remove_file(&host_transport);
+    if let Some(host_audio) = host_audio.as_deref() {
+        let _ = std::fs::remove_file(host_audio);
+    }
 
     let mut cmd = Command::new(container);
     cmd.env("PATH", child_path)
@@ -373,7 +436,13 @@ fn run_publish_socket_relay(
         .arg(format!("{}:{}", host_transport, guest_transport))
         .arg("--env")
         .arg(format!("XDG_RUNTIME_DIR={}", default_guest_runtime_dir()));
-    for env in relay_env_list(RELAY_ENV_LIST_ENV) {
+    if let Some(host_audio) = host_audio.as_deref() {
+        cmd.arg("--publish-socket")
+            .arg(format!("{}:{}", host_audio, guest_audio))
+            .arg("--env")
+            .arg(format!("{}={}", GUEST_AUDIO_SOCKET_ENV, guest_audio));
+    }
+    for env in environment {
         if !env.starts_with("XDG_RUNTIME_DIR=") {
             cmd.arg("--env").arg(env);
         }
@@ -404,6 +473,9 @@ fn run_publish_socket_relay(
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_file(&host_transport);
+        if let Some(host_audio) = host_audio.as_deref() {
+            let _ = std::fs::remove_file(host_audio);
+        }
         return Err(PublishRelayError::Startup(error));
     }
     let mut transport =
@@ -413,6 +485,9 @@ fn run_publish_socket_relay(
                 let _ = child.kill();
                 let _ = child.wait();
                 let _ = std::fs::remove_file(&host_transport);
+                if let Some(host_audio) = host_audio.as_deref() {
+                    let _ = std::fs::remove_file(host_audio);
+                }
                 return Err(PublishRelayError::Startup(error));
             }
         };
@@ -436,6 +511,9 @@ fn run_publish_socket_relay(
         .wait()
         .map_err(|error| PublishRelayError::Active(error.to_string()))?;
     let _ = std::fs::remove_file(&host_transport);
+    if let Some(host_audio) = host_audio.as_deref() {
+        let _ = std::fs::remove_file(host_audio);
+    }
     relay_result.map_err(PublishRelayError::Active)?;
     if status.success() {
         Ok(())
@@ -534,13 +612,33 @@ pub fn apple_publish_socket_supported(container: &Path, child_path: &str) -> boo
 }
 
 fn relay_transport_host_socket(local_socket: &str) -> Result<String, String> {
-    let parent = short_host_socket_root();
+    relay_aux_host_socket(local_socket, "v2")
+}
+
+fn relay_audio_host_socket(local_socket: &str) -> Result<String, String> {
+    relay_aux_host_socket(local_socket, "audio")
+}
+
+fn relay_aux_host_socket(local_socket: &str, kind: &str) -> Result<String, String> {
+    // The relay runs in a child Cocoa-Way process, so a path derived from
+    // std::process::id() differs from the one later computed by the main
+    // process. Anchor auxiliary sockets beside the already-stable session
+    // socket instead.
+    let parent = Path::new(local_socket)
+        .parent()
+        .ok_or_else(|| format!("session socket `{}` has no parent directory", local_socket))?;
     create_private_socket_dir(&parent)
         .map_err(|error| format!("failed to create transport directory: {}", error))?;
-    Ok(parent
-        .join(format!("v2-{:016x}.sock", stable_name_hash(local_socket)))
-        .display()
-        .to_string())
+    let socket = parent.join(format!(
+        "{}-{:016x}.sock",
+        kind,
+        stable_name_hash(local_socket)
+    ));
+    let socket = socket.display().to_string();
+    if socket.as_bytes().len() >= UNIX_SOCKET_PATH_BYTES {
+        return Err(format!("auxiliary socket path is too long: `{}`", socket));
+    }
+    Ok(socket)
 }
 
 fn connect_published_socket(
@@ -899,6 +997,24 @@ for my $path ($sock_path, $transport_path) {
 make_path($ENV{XDG_RUNTIME_DIR}) if exists $ENV{XDG_RUNTIME_DIR} && length($ENV{XDG_RUNTIME_DIR}) && !-d $ENV{XDG_RUNTIME_DIR};
 my $server = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $sock_path, Listen => 128) or die "listen $sock_path: $!\n";
 my $transport_server = IO::Socket::UNIX->new(Type => SOCK_STREAM, Local => $transport_path, Listen => 1) or die "listen $transport_path: $!\n";
+my $audio_pid;
+if (exists $ENV{COCOA_WAY_AUDIO_SOCKET} && length($ENV{COCOA_WAY_AUDIO_SOCKET}) && -x "/usr/local/bin/cocoa-way-audio-relay") {
+  my $ready = "/tmp/cocoa-way-audio.ready";
+  unlink $ready;
+  $audio_pid = fork();
+  die "audio fork: $!\n" unless defined $audio_pid;
+  if ($audio_pid == 0) {
+    $ENV{COCOA_WAY_AUDIO_READY} = $ready;
+    exec "/usr/local/bin/cocoa-way-audio-relay";
+    die "exec cocoa-way-audio-relay: $!\n";
+  }
+  my $attempt = 0;
+  while ((!-e $ready || !-S $ENV{COCOA_WAY_AUDIO_SOCKET}) && $attempt < 200) {
+    $attempt++;
+    select undef, undef, undef, 0.05;
+  }
+  die "audio relay did not become ready\n" unless -e $ready && -S $ENV{COCOA_WAY_AUDIO_SOCKET};
+}
 STDOUT->autoflush(1);
 print STDOUT "COCOA_WAY_TRANSPORT_V2_READY\n";
 my $pid = fork();
@@ -1007,6 +1123,10 @@ unless ($child_exited) {
   kill 'TERM', $pid;
   waitpid($pid, 0);
 }
+if (defined $audio_pid) {
+  kill 'TERM', $audio_pid;
+  waitpid($audio_pid, 0);
+}
 unlink $sock_path;
 unlink $transport_path;
 "#
@@ -1014,6 +1134,16 @@ unlink $transport_path;
 
 fn default_runtime() -> String {
     "container".into()
+}
+
+fn default_audio() -> bool {
+    true
+}
+
+impl ContainerSession {
+    pub fn presentation_mode(&self) -> crate::presentation::PresentationMode {
+        crate::presentation::PresentationMode::parse(self.presentation.as_deref())
+    }
 }
 
 pub fn config_path() -> std::path::PathBuf {
@@ -1044,9 +1174,11 @@ pub fn load_sessions_report() -> SessionLoadReport {
 # runtime = "container"
 # image = "localhost/cocoa-way-niri:latest"
 # display = "auto"
+# presentation = "desktop"
 # profile = "niri"
 # command = "niri"
 # waypipe_compress = "none"
+# audio = true
 
 # [[session]]
 # name = "Single App Diagnostic"
@@ -1170,7 +1302,7 @@ fn line_offsets(content: &str) -> impl Iterator<Item = (usize, &str)> {
     })
 }
 
-fn session_to_toml(session: &ContainerSession) -> String {
+pub(crate) fn session_to_toml(session: &ContainerSession) -> String {
     let mut content = String::new();
     content.push_str("[[session]]\n");
     content.push_str(&format!("name = \"{}\"\n", toml_escape(&session.name)));
@@ -1181,6 +1313,16 @@ fn session_to_toml(session: &ContainerSession) -> String {
     content.push_str(&format!("image = \"{}\"\n", toml_escape(&session.image)));
     if let Some(display) = session.display.as_deref().filter(|value| !value.is_empty()) {
         content.push_str(&format!("display = \"{}\"\n", toml_escape(display)));
+    }
+    if let Some(presentation) = session
+        .presentation
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        content.push_str(&format!(
+            "presentation = \"{}\"\n",
+            toml_escape(presentation)
+        ));
     }
     if let Some(profile) = session.profile.as_deref().filter(|value| !value.is_empty()) {
         content.push_str(&format!("profile = \"{}\"\n", toml_escape(profile)));
@@ -1221,6 +1363,7 @@ fn session_to_toml(session: &ContainerSession) -> String {
     if let Some(threads) = session.waypipe_threads {
         content.push_str(&format!("waypipe_threads = {}\n", threads));
     }
+    content.push_str(&format!("audio = {}\n", session.audio));
     if !session.runtime_args.is_empty() {
         content.push_str(&format!(
             "runtime_args = [{}]\n",
@@ -1277,13 +1420,16 @@ pub fn check_session(session: &ContainerSession) -> Result<CheckReport, LaunchEr
     })
 }
 
-pub fn launch_session(
+pub fn launch_checked_session(
     session: &ContainerSession,
     runtime_dir: &str,
     display: &str,
+    check: CheckReport,
+    mut progress: impl FnMut(crate::application_model::LaunchStep, &str),
 ) -> Result<LaunchReport, LaunchError> {
+    use crate::application_model::LaunchStep;
+
     let child_path = build_child_path();
-    let check = check_session(session)?;
     let waypipe = std::path::PathBuf::from(&check.waypipe);
     let runtime_binary_name = runtime_binary_name(&session.runtime);
     let runtime_kind = normalize_container_runtime(&session.runtime);
@@ -1306,11 +1452,26 @@ pub fn launch_session(
         .unwrap_or_else(|| default_container_socket_path(&host_socket, runtime_kind));
     let container_name = container_name(session);
     if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name) {
-        return Err(LaunchError::ContainerAlreadyRunning {
-            runtime: runtime_label(&session.runtime).into(),
-            container_name,
-            hint: "Stop the existing container from Container Mode before launching this profile again, or choose a different profile name.".into(),
-        });
+        if matches!(runtime_kind, ContainerRuntime::Apple) {
+            progress(
+                LaunchStep::CreateContainer,
+                "Removing an untracked Cocoa-Way Apple Container instance left by an earlier run",
+            );
+            cleanup_named_runtime_container(
+                runtime_kind,
+                &runtime_binary,
+                &child_path,
+                &container_name,
+            );
+        }
+        if runtime_container_is_running(runtime_kind, &runtime_binary, &child_path, &container_name)
+        {
+            return Err(LaunchError::ContainerAlreadyRunning {
+                runtime: runtime_label(&session.runtime).into(),
+                container_name,
+                hint: "Stop the existing container from Container Mode before launching this profile again, or choose a different profile name.".into(),
+            });
+        }
     }
 
     let command = session_command(session);
@@ -1361,6 +1522,16 @@ pub fn launch_session(
         }
     }
 
+    let audio_host_socket = if matches!(runtime_kind, ContainerRuntime::Apple) && session.audio {
+        Some(
+            relay_audio_host_socket(&host_socket).map_err(|_| LaunchError::InvalidSocketPath {
+                host_socket: host_socket.clone(),
+            })?,
+        )
+    } else {
+        None
+    };
+
     let (container_child, waypipe_child) = match runtime_kind {
         ContainerRuntime::Apple => {
             cleanup_named_runtime_container(
@@ -1368,6 +1539,10 @@ pub fn launch_session(
                 &runtime_binary,
                 &child_path,
                 &container_name,
+            );
+            progress(
+                LaunchStep::StartWaypipe,
+                "Starting the native socket transport and Waypipe client",
             );
             let waypipe_child = spawn_apple_container_waypipe_ssh(
                 &waypipe,
@@ -1379,10 +1554,19 @@ pub fn launch_session(
                 &container_socket,
                 &container_name,
                 &command,
+                audio_host_socket.as_deref(),
             )?;
+            progress(
+                LaunchStep::StartCommand,
+                "The application command was handed to Apple Container",
+            );
             (None, waypipe_child)
         }
         ContainerRuntime::Docker | ContainerRuntime::OrbStack => {
+            progress(
+                LaunchStep::StartWaypipe,
+                "Starting the Waypipe client for the selected display",
+            );
             let mut waypipe_child = spawn_waypipe_client(
                 &waypipe,
                 &child_path,
@@ -1407,6 +1591,10 @@ pub fn launch_session(
                     });
                 }
             };
+            progress(
+                LaunchStep::StartCommand,
+                "The application command was started inside the container",
+            );
             (Some(container_child), waypipe_child)
         }
     };
@@ -1417,6 +1605,7 @@ pub fn launch_session(
         container_name,
         host_socket,
         container_socket,
+        audio_host_socket,
         command,
     })
 }
@@ -1624,6 +1813,7 @@ fn preflight_session(
     child_path: &str,
 ) -> Result<(), LaunchError> {
     validate_display_slot(session)?;
+    validate_presentation_command(session)?;
     match runtime {
         ContainerRuntime::Apple => {
             preflight_apple_container(runtime_binary, child_path)?;
@@ -1665,6 +1855,41 @@ fn preflight_session(
         }
         ContainerRuntime::OrbStack => Ok(()),
     }
+}
+
+fn validate_presentation_command(session: &ContainerSession) -> Result<(), LaunchError> {
+    if !session.presentation_mode().is_rootless() {
+        return Ok(());
+    }
+
+    let Some(command) = session_command_binary(session) else {
+        return Ok(());
+    };
+    let binary = Path::new(&command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&command)
+        .to_ascii_lowercase();
+    match binary.as_str() {
+        "xterm" => {
+            return Err(LaunchError::UnsupportedDisplay {
+                display: "rootless".into(),
+                hint: "xterm is an X11 application, but Cocoa-Way rootless currently accepts native Wayland applications. Use foot for validation, or use desktop mode until Xwayland integration is available.".into(),
+            });
+        }
+        "niri" | "hyprland" => {
+            return Err(LaunchError::UnsupportedDisplay {
+                display: "rootless".into(),
+                hint: format!(
+                    "{} is a desktop compositor. Select desktop presentation for compositor sessions; rootless presentation is for individual native Wayland applications.",
+                    command
+                ),
+            });
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn validate_display_slot(session: &ContainerSession) -> Result<(), LaunchError> {
@@ -1748,47 +1973,76 @@ fn verify_gui_tools_in_image(
     runtime_label: &str,
     image: &str,
 ) -> Result<(), LaunchError> {
-    let mut cmd = Command::new(runtime_binary);
-    cmd.env("PATH", child_path);
-    cmd.arg("run").arg("--rm");
-    for env in &session.env {
-        cmd.arg("--env").arg(env);
-    }
-    for mount in &session.mounts {
-        cmd.arg("--mount").arg(mount);
-    }
-    for arg in &session.runtime_args {
-        cmd.arg(arg);
-    }
-    let mut probes = vec!["command -v waypipe >/dev/null".to_string()];
+    let run_probes = |probes: &[String]| {
+        let mut cmd = Command::new(runtime_binary);
+        cmd.env("PATH", child_path);
+        cmd.arg("run").arg("--rm");
+        for env in &session.env {
+            cmd.arg("--env").arg(env);
+        }
+        for mount in &session.mounts {
+            cmd.arg("--mount").arg(mount);
+        }
+        for arg in &session.runtime_args {
+            cmd.arg(arg);
+        }
+        let script = probes.join(" && ");
+        cmd.args([image, "sh", "-lc", &script]);
+        cmd.output()
+    };
+
+    let mut required_probes = vec!["command -v waypipe >/dev/null".to_string()];
     if matches!(runtime, ContainerRuntime::Apple) {
-        probes.push("command -v perl >/dev/null".into());
+        required_probes.push("command -v perl >/dev/null".into());
     }
     if let Some(binary) = session_command_binary(session) {
-        probes.push(format!(
+        required_probes.push(format!(
             "command -v {} >/dev/null",
             shell_single_quote(&binary)
         ));
     }
-    cmd.args([image, "sh", "-lc", &probes.join(" && ")]);
-    let output = match runtime {
-        ContainerRuntime::Apple | ContainerRuntime::Docker | ContainerRuntime::OrbStack => {
-            cmd.output()
-        }
-    };
 
-    match output {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(_) => Err(LaunchError::ImageNotGuiReady {
+    match run_probes(&required_probes) {
+        Ok(output) if output.status.success() => {}
+        Ok(_) => {
+            return Err(LaunchError::ImageNotGuiReady {
             runtime: runtime_label.into(),
             image: image.into(),
             hint: "Install waypipe, Apple relay dependencies, and the configured GUI command in the image, then rebuild/tag it for Cocoa-Way.".into(),
-        }),
-        Err(source) => Err(LaunchError::StartContainer {
-            session: format!("{} GUI readiness check", runtime_label),
-            source,
-        }),
+            });
+        }
+        Err(source) => {
+            return Err(LaunchError::StartContainer {
+                session: format!("{} GUI readiness check", runtime_label),
+                source,
+            });
+        }
     }
+
+    if matches!(runtime, ContainerRuntime::Apple) && session.audio {
+        let audio_probes = [
+            "command -v cocoa-way-audio-relay >/dev/null".into(),
+            "command -v pipewire >/dev/null".into(),
+            "command -v pipewire-pulse >/dev/null".into(),
+            "command -v wireplumber >/dev/null".into(),
+            "command -v pactl >/dev/null".into(),
+            "command -v parec >/dev/null".into(),
+        ];
+        match run_probes(&audio_probes) {
+            Ok(output) if output.status.success() => {}
+            Ok(_) => log::warn!(
+                "Apple Container image '{}' has no complete Cocoa-Way audio stack; GUI launch will continue without audio",
+                image
+            ),
+            Err(source) => log::warn!(
+                "Could not inspect optional audio tools in Apple Container image '{}': {}",
+                image,
+                source
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 fn runtime_binary_name(runtime: &str) -> &str {
@@ -2015,10 +2269,11 @@ fn spawn_apple_container_waypipe_ssh(
     container_socket: &str,
     container_name: &str,
     command: &str,
+    audio_host_socket: Option<&str>,
 ) -> Result<Child, LaunchError> {
     let helper = std::env::current_exe().map_err(|source| LaunchError::StartWaypipe { source })?;
     let helper = helper.to_string_lossy().to_string();
-    let remote_command = apple_remote_gui_command(command);
+    let remote_command = apple_remote_gui_command(command, uses_nested_wayland_compositor(session));
     let mut cmd = Command::new(waypipe);
     cmd.env("PATH", child_path)
         .env("XDG_RUNTIME_DIR", runtime_dir)
@@ -2031,6 +2286,12 @@ fn spawn_apple_container_waypipe_ssh(
         .env(RELAY_RUNTIME_ARGS_ENV, session.runtime_args.join("\n"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if session.audio {
+        cmd.env(RELAY_AUDIO_ENV, "1");
+        if let Some(audio_host_socket) = audio_host_socket {
+            cmd.env(RELAY_AUDIO_HOST_ENV, audio_host_socket);
+        }
+    }
     cmd.args(waypipe_tuning_args(session, ContainerRuntime::Apple));
     cmd.args([
         "--socket",
@@ -2051,11 +2312,46 @@ fn spawn_apple_container_waypipe_ssh(
         .map_err(|source| LaunchError::StartWaypipe { source })
 }
 
-fn apple_remote_gui_command(command: &str) -> String {
+fn uses_nested_wayland_compositor(session: &ContainerSession) -> bool {
+    let profile = session
+        .profile
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        profile.as_str(),
+        "niri" | "hyprland" | "sway" | "wayfire" | "weston"
+    ) {
+        return true;
+    }
+
+    session_command_binary(session)
+        .and_then(|command| {
+            Path::new(&command)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+        })
+        .is_some_and(|command| {
+            matches!(
+                command.as_str(),
+                "niri" | "hyprland" | "sway" | "wayfire" | "weston"
+            )
+        })
+}
+
+fn apple_remote_gui_command(command: &str, bridge_nested_clipboard: bool) -> String {
+    let launch = if bridge_nested_clipboard {
+        format!(
+            "if command -v cocoa-way-clipboard-relay >/dev/null 2>&1; then exec cocoa-way-clipboard-relay sh -lc {}; else exec {}; fi",
+            shell_single_quote(command),
+            command,
+        )
+    } else {
+        format!("exec {command}")
+    };
     format!(
-        "sleep 0.35; if command -v cocoa-way-clipboard-relay >/dev/null 2>&1; then exec cocoa-way-clipboard-relay sh -lc {}; else exec {}; fi",
-        shell_single_quote(command),
-        command,
+        "sleep 0.35; if [ -n \"${{COCOA_WAY_AUDIO_SOCKET:-}}\" ] && [ -e /tmp/cocoa-way-audio.ready ]; then export PULSE_SERVER=\"unix:${{XDG_RUNTIME_DIR:-/tmp/cocoa-way}}/pulse/native\" PULSE_SINK=cocoa_way; fi; export MOZ_ENABLE_WAYLAND=${{MOZ_ENABLE_WAYLAND:-1}}; {launch}"
     )
 }
 
@@ -2187,10 +2483,32 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     }
 
     #[test]
-    fn transport_socket_lives_next_to_the_waypipe_socket() {
+    fn publish_socket_relay_prepares_audio_before_transport_ready() {
+        let relay = guest_publish_socket_relay_perl();
+        let audio = relay
+            .find("exec \"/usr/local/bin/cocoa-way-audio-relay\"")
+            .unwrap();
+        let ready = relay.find(RELAY_V2_READY_LINE).unwrap();
+        assert!(audio < ready);
+        assert!(relay.contains("audio relay did not become ready"));
+    }
+
+    #[test]
+    fn transport_socket_lives_next_to_the_session_socket() {
         let socket = relay_transport_host_socket("/tmp/cocoa-way/session.sock").unwrap();
-        assert!(socket.starts_with("/tmp/cw-"));
+        assert!(socket.starts_with("/tmp/cocoa-way/v2-"));
         assert!(socket.ends_with(".sock"));
+    }
+
+    #[test]
+    fn audio_socket_is_short_and_separate_from_transport() {
+        let source = "/tmp/cocoa-way/session.sock";
+        let transport = relay_transport_host_socket(source).unwrap();
+        let audio = relay_audio_host_socket(source).unwrap();
+        assert!(audio.starts_with("/tmp/cocoa-way/audio-"));
+        assert!(audio.ends_with(".sock"));
+        assert_ne!(audio, transport);
+        assert!(audio.as_bytes().len() < UNIX_SOCKET_PATH_BYTES);
     }
 
     #[test]
@@ -2222,11 +2540,22 @@ old-session             localhost/example:latest         linux  arm64  stopped  
     }
 
     #[test]
-    fn apple_gui_command_uses_optional_nested_clipboard_relay() {
-        let command = apple_remote_gui_command("niri --session");
+    fn apple_gui_command_uses_audio_environment_and_optional_clipboard_relay() {
+        let command = apple_remote_gui_command("niri --session", true);
+        assert!(command.contains("COCOA_WAY_AUDIO_SOCKET"));
+        assert!(command.contains("cocoa-way-audio.ready"));
+        assert!(command.contains("PULSE_SINK=cocoa_way"));
+        assert!(command.contains("MOZ_ENABLE_WAYLAND"));
         assert!(command.contains("command -v cocoa-way-clipboard-relay"));
         assert!(command.contains("cocoa-way-clipboard-relay sh -lc 'niri --session'"));
         assert!(command.contains("else exec niri --session"));
+    }
+
+    #[test]
+    fn direct_apps_do_not_mistake_waypipe_proxy_sockets_for_nested_compositors() {
+        let command = apple_remote_gui_command("firefox", false);
+        assert!(command.contains("exec firefox"));
+        assert!(!command.contains("cocoa-way-clipboard-relay"));
     }
 
     #[test]
@@ -2251,6 +2580,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
             display: Some("auto".into()),
+            presentation: None,
             profile: Some("niri".into()),
             app: None,
             command: Some("niri".into()),
@@ -2259,6 +2589,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             waypipe_path: None,
             waypipe_compress: None,
             waypipe_threads: None,
+            audio: false,
             runtime_args: Vec::new(),
             mounts: Vec::new(),
             env: Vec::new(),
@@ -2278,6 +2609,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
             display: Some("auto".into()),
+            presentation: None,
             profile: Some("niri".into()),
             app: None,
             command: None,
@@ -2286,6 +2618,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             waypipe_path: None,
             waypipe_compress: None,
             waypipe_threads: None,
+            audio: false,
             runtime_args: Vec::new(),
             mounts: Vec::new(),
             env: Vec::new(),
@@ -2297,6 +2630,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
             display: Some("external".into()),
+            presentation: None,
             profile: Some("niri".into()),
             app: None,
             command: None,
@@ -2305,6 +2639,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             waypipe_path: None,
             waypipe_compress: None,
             waypipe_threads: None,
+            audio: false,
             runtime_args: Vec::new(),
             mounts: Vec::new(),
             env: Vec::new(),
@@ -2319,6 +2654,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             image: "localhost/cocoa-way-niri:latest".into(),
             runtime: "container".into(),
             display: Some("default".into()),
+            presentation: None,
             profile: Some("niri".into()),
             app: None,
             command: None,
@@ -2327,6 +2663,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             waypipe_path: None,
             waypipe_compress: None,
             waypipe_threads: None,
+            audio: false,
             runtime_args: Vec::new(),
             mounts: Vec::new(),
             env: Vec::new(),
@@ -2342,6 +2679,7 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             image: "localhost/cocoa-way-smoke:latest".into(),
             runtime: "docker".into(),
             display: Some("default".into()),
+            presentation: None,
             profile: Some("single-app".into()),
             app: None,
             command: Some("foot".into()),
@@ -2350,10 +2688,143 @@ old-session             localhost/example:latest         linux  arm64  stopped  
             waypipe_path: None,
             waypipe_compress: None,
             waypipe_threads: None,
+            audio: false,
             runtime_args: Vec::new(),
             mounts: Vec::new(),
             env: Vec::new(),
         };
         assert!(terminal_command(&session).contains("docker exec -it 'cocoa-way-smoke-app'"));
+    }
+
+    #[test]
+    fn missing_presentation_keeps_the_desktop_behavior() {
+        let session = ContainerSession {
+            name: "Legacy Desktop".into(),
+            image: "example:latest".into(),
+            runtime: "container".into(),
+            display: Some("auto".into()),
+            presentation: None,
+            profile: None,
+            app: None,
+            command: Some("true".into()),
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            audio: false,
+            runtime_args: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        };
+
+        assert_eq!(
+            session.presentation_mode(),
+            crate::presentation::PresentationMode::Desktop
+        );
+    }
+
+    #[test]
+    fn session_toml_preserves_rootless_presentation() {
+        let session = ContainerSession {
+            name: "Rootless App".into(),
+            image: "example:latest".into(),
+            runtime: "container".into(),
+            display: Some("auto".into()),
+            presentation: Some("rootless".into()),
+            profile: Some("single-app".into()),
+            app: None,
+            command: Some("foot".into()),
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            audio: true,
+            runtime_args: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        };
+
+        let serialized = session_to_toml(&session);
+        assert!(serialized.contains("presentation = \"rootless\""));
+        assert!(serialized.contains("audio = true"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.session[0].presentation.as_deref(),
+            Some("rootless")
+        );
+        assert!(reparsed.session[0].audio);
+    }
+
+    #[test]
+    fn omitted_audio_defaults_to_enabled_and_explicit_off_is_preserved() {
+        let enabled: Config =
+            toml::from_str("[[session]]\nname = \"Default Audio\"\nimage = \"example:latest\"\n")
+                .unwrap();
+        assert!(enabled.session[0].audio);
+
+        let disabled: Config = toml::from_str(
+            "[[session]]\nname = \"Muted\"\nimage = \"example:latest\"\naudio = false\n",
+        )
+        .unwrap();
+        assert!(!disabled.session[0].audio);
+        assert!(session_to_toml(&disabled.session[0]).contains("audio = false"));
+    }
+
+    #[test]
+    fn rootless_rejects_xterm_without_xwayland() {
+        let session = ContainerSession {
+            name: "Rootless Xterm".into(),
+            image: "example:latest".into(),
+            runtime: "container".into(),
+            display: Some("auto".into()),
+            presentation: Some("rootless".into()),
+            profile: Some("single-app".into()),
+            app: None,
+            command: Some("/usr/bin/xterm".into()),
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            audio: false,
+            runtime_args: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        };
+
+        assert!(matches!(
+            validate_presentation_command(&session),
+            Err(LaunchError::UnsupportedDisplay { .. })
+        ));
+    }
+
+    #[test]
+    fn rootless_rejects_nested_desktop_compositors() {
+        let session = ContainerSession {
+            name: "Rootless Niri".into(),
+            image: "example:latest".into(),
+            runtime: "container".into(),
+            display: Some("auto".into()),
+            presentation: Some("rootless".into()),
+            profile: Some("niri".into()),
+            app: None,
+            command: Some("niri".into()),
+            socket: None,
+            container_socket: None,
+            waypipe_path: None,
+            waypipe_compress: None,
+            waypipe_threads: None,
+            audio: false,
+            runtime_args: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+        };
+
+        assert!(matches!(
+            validate_presentation_command(&session),
+            Err(LaunchError::UnsupportedDisplay { .. })
+        ));
     }
 }

@@ -78,6 +78,7 @@ find_managed_display() {
     local marker candidate socket
     for marker in /tmp/cwd-*/display.slot; do
         [ -f "$marker" ] || continue
+        managed_display_is_live "$marker" || continue
         [ "$(cat "$marker" 2>/dev/null || true)" = "$requested_slot" ] || continue
         candidate=$(dirname "$marker")
         socket=$(find_wayland_socket "$candidate" || true)
@@ -90,6 +91,23 @@ find_managed_display() {
     return 1
 }
 
+managed_display_is_live() {
+    local marker="$1"
+    local directory base parent_pid command
+    directory=$(dirname "$marker")
+    if [ -f "$directory/display.parent" ]; then
+        parent_pid=$(cat "$directory/display.parent" 2>/dev/null || true)
+    else
+        base=$(basename "$directory")
+        parent_pid=${base#cwd-}
+        parent_pid=${parent_pid%%-*}
+    fi
+    [[ "$parent_pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$parent_pid" 2>/dev/null || return 1
+    command=$(ps -p "$parent_pid" -o command= 2>/dev/null || true)
+    [[ "$command" == *cocoa-way* ]]
+}
+
 runtime_dir=""
 display=""
 
@@ -100,6 +118,7 @@ if $list_displays; then
     fi
     for marker in /tmp/cwd-*/display.slot; do
         [ -f "$marker" ] || continue
+        managed_display_is_live "$marker" || continue
         slot=$(cat "$marker" 2>/dev/null || true)
         candidate=$(dirname "$marker")
         socket=$(find_wayland_socket "$candidate" || true)

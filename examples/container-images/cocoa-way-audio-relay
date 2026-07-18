@@ -1,0 +1,82 @@
+#!/bin/sh
+set -eu
+
+audio_socket=${COCOA_WAY_AUDIO_SOCKET:-}
+runtime_dir=${XDG_RUNTIME_DIR:-/tmp/cocoa-way}
+sink_name=cocoa_way
+ready_file=${COCOA_WAY_AUDIO_READY:-/tmp/cocoa-way-audio.ready}
+
+[ -n "$audio_socket" ] || exit 0
+mkdir -p "$runtime_dir" "$(dirname "$audio_socket")"
+rm -f "$ready_file"
+export XDG_RUNTIME_DIR="$runtime_dir"
+export PULSE_SERVER="unix:$runtime_dir/pulse/native"
+
+if ! pactl info >/dev/null 2>&1; then
+    pipewire >/tmp/cocoa-way-pipewire.log 2>&1 &
+    pipewire-pulse >/tmp/cocoa-way-pipewire-pulse.log 2>&1 &
+fi
+
+attempt=0
+until pactl info >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 80 ] || exit 1
+    sleep 0.05
+done
+
+# PipeWire exposes the Pulse socket before a session manager is ready to
+# accept default-device metadata. Fresh Apple Container instances do not run
+# a user session, so start the lightweight manager explicitly.
+if command -v wireplumber >/dev/null 2>&1; then
+    wireplumber >/tmp/cocoa-way-wireplumber.log 2>&1 &
+fi
+
+if ! pactl list short sinks | awk '{print $2}' | grep -qx "$sink_name"; then
+    pactl load-module module-null-sink \
+        sink_name="$sink_name" \
+        rate=48000 \
+        channels=2 \
+        channel_map=front-left,front-right >/dev/null
+fi
+
+attempt=0
+until pactl set-default-sink "$sink_name" >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 80 ] || exit 1
+    sleep 0.05
+done
+touch "$ready_file"
+
+exec perl -MIO::Socket::UNIX -MSocket=SOCK_STREAM -e '
+    use strict;
+    use warnings;
+    $SIG{PIPE} = "IGNORE";
+    my $path = shift @ARGV;
+    unlink $path;
+    my $server = IO::Socket::UNIX->new(
+        Type => SOCK_STREAM,
+        Local => $path,
+        Listen => 1,
+    ) or die "listen $path: $!\n";
+    while (my $peer = $server->accept()) {
+        binmode $peer;
+        my $capture_pid = open my $capture, "-|", "parec", "--device=cocoa_way.monitor",
+            "--format=s16le", "--rate=48000", "--channels=2",
+            "--latency-msec=10", "--process-time-msec=5"
+            or next;
+        binmode $capture;
+        my $buffer;
+        while (sysread($capture, $buffer, 65536)) {
+            my $offset = 0;
+            while ($offset < length($buffer)) {
+                my $written = syswrite($peer, $buffer, length($buffer) - $offset, $offset);
+                last unless defined $written && $written > 0;
+                $offset += $written;
+            }
+            last if $offset < length($buffer);
+        }
+        kill "TERM", $capture_pid;
+        close $capture;
+        close $peer;
+    }
+' "$audio_socket"

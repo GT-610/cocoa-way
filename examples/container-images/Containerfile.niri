@@ -1,17 +1,29 @@
-FROM registry.fedoraproject.org/fedora:42
+FROM registry.fedoraproject.org/fedora:44
 
-RUN dnf install -y \
+COPY examples/container-images/fedora-cocoa-way.repo /etc/yum.repos.d/cocoa-way.repo
+
+RUN dnf --disablerepo='*' \
+        --enablerepo=cocoa-way-fedora,cocoa-way-updates \
+        install -y \
         ca-certificates \
         dbus-daemon \
+        firefox \
         foot \
+        google-noto-emoji-color-fonts \
+        google-noto-sans-fonts \
         niri \
         perl \
+        pipewire \
+        pipewire-pulseaudio \
+        pulseaudio-utils \
+        wireplumber \
         waypipe \
         wl-clipboard \
         xterm \
     && dnf clean all
 
 COPY examples/container-images/cocoa-way-clipboard-relay /usr/local/bin/cocoa-way-clipboard-relay
-RUN chmod +x /usr/local/bin/cocoa-way-clipboard-relay
+COPY examples/container-images/cocoa-way-audio-relay /usr/local/bin/cocoa-way-audio-relay
+RUN chmod +x /usr/local/bin/cocoa-way-clipboard-relay /usr/local/bin/cocoa-way-audio-relay
 
 CMD ["niri"]

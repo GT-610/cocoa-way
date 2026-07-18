@@ -52,6 +52,9 @@ while [ "$attempts" -lt 100 ] && kill -0 "$application_pid" 2>/dev/null; do
         [ -S "$socket" ] || continue
         candidate=${socket##*/}
         [ "$candidate" = "$outer_display" ] && continue
+        case "$candidate" in
+            wayland-proxy-*) continue ;;
+        esac
         inner_display=$candidate
         break
     done

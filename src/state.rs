@@ -16,6 +16,13 @@ use smithay::wayland::shell::xdg::{XdgShellHandler, XdgShellState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationState, XdgDecorationHandler};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use crate::layout::Layout;
+
+pub struct PendingFrameCallback {
+    pub root_surface: Option<smithay::reexports::wayland_server::backend::ObjectId>,
+    pub source_surface: WlSurface,
+    pub callback: smithay::reexports::wayland_server::protocol::wl_callback::WlCallback,
+}
+
 pub struct AppState {
     display_handle: DisplayHandle,
     pub compositor_state: CompositorState,
@@ -29,6 +36,7 @@ pub struct AppState {
     _viewporter_state: smithay::wayland::viewporter::ViewporterState,
     _fractional_scale_state: smithay::wayland::fractional_scale::FractionalScaleManagerState,
     _pointer_constraints_state: smithay::wayland::pointer_constraints::PointerConstraintsState,
+    _pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState,
     _relative_pointer_state: smithay::wayland::relative_pointer::RelativePointerManagerState,
     _output_state: smithay::wayland::output::OutputManagerState,
     pub output: smithay::output::Output,
@@ -45,17 +53,22 @@ pub struct AppState {
     )>,
     pub start_drag_request: Option<smithay::reexports::wayland_server::backend::ObjectId>,
     pub loop_signal: std::sync::mpsc::Sender<crate::messages::CompositorMessage>,
+    pub presentation: crate::presentation::PresentationMode,
     pub width: u32,
     pub height: u32,
     pub scale_factor: f64,
     /// Monotonic start time — used to compute frame timestamps for wl_callback::done.
     pub start_time: std::time::Instant,
     /// Frame callbacks collected during commit(); fired after swap_buffers().
-    pub pending_frame_callbacks:
-        Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback>,
+    pub pending_frame_callbacks: Vec<PendingFrameCallback>,
     /// Set by Wayland commits or layout changes so the winit loop can avoid
     /// continuous redraws when the scene is idle.
     pub needs_redraw: bool,
+    /// Root toplevels changed since the previous rootless frame. Keeping this
+    /// separate avoids redrawing every native window when one application
+    /// submits a new buffer.
+    pub rootless_dirty_surfaces:
+        std::collections::HashSet<smithay::reexports::wayland_server::backend::ObjectId>,
     /// Total Wayland surface commits observed since startup. Used for lightweight
     /// performance diagnostics in Container Mode.
     pub commit_counter: u64,
@@ -63,12 +76,121 @@ pub struct AppState {
     pending_guest_clipboard_mime: Option<String>,
     pasteboard_change_count: isize,
     last_pasteboard_poll: std::time::Instant,
+    pointer_gesture: PointerGestureTracker,
+    pointer_axis: PointerAxisTracker,
 }
+
+#[derive(Debug)]
+struct PointerGestureTracker {
+    magnify_active: bool,
+    rotation_active: bool,
+    protocol_active: bool,
+    swipe_active: bool,
+    scale: f64,
+    rotation: f64,
+}
+
+impl Default for PointerGestureTracker {
+    fn default() -> Self {
+        Self {
+            magnify_active: false,
+            rotation_active: false,
+            protocol_active: false,
+            swipe_active: false,
+            scale: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct PointerAxisTracker {
+    horizontal_active: bool,
+    vertical_active: bool,
+}
+
+impl PointerAxisTracker {
+    fn frame(
+        &mut self,
+        scale_factor: f64,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+        time: u32,
+    ) -> Option<smithay::input::pointer::AxisFrame> {
+        use smithay::backend::input::{AxisRelativeDirection, AxisSource};
+        use winit::event::{MouseScrollDelta, TouchPhase};
+
+        if phase == TouchPhase::Started {
+            self.horizontal_active = false;
+            self.vertical_active = false;
+        }
+
+        let (axis, source, v120) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                let horizontal = -f64::from(x) * 10.0;
+                let vertical = -f64::from(y) * 10.0;
+                let to_v120 = |value: f32| {
+                    (-f64::from(value) * 120.0)
+                        .round()
+                        .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+                };
+                (
+                    (horizontal, vertical),
+                    AxisSource::Wheel,
+                    Some((to_v120(x), to_v120(y))),
+                )
+            }
+            MouseScrollDelta::PixelDelta(position) => {
+                let logical = position.to_logical::<f64>(scale_factor.max(f64::EPSILON));
+                ((-logical.x, -logical.y), AxisSource::Finger, None)
+            }
+        };
+
+        let horizontal_moved = axis.0 != 0.0;
+        let vertical_moved = axis.1 != 0.0;
+        let terminal = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
+        let stop = if source == AxisSource::Finger && terminal {
+            (
+                self.horizontal_active || horizontal_moved,
+                self.vertical_active || vertical_moved,
+            )
+        } else {
+            (false, false)
+        };
+
+        if source == AxisSource::Finger && !terminal {
+            self.horizontal_active |= horizontal_moved;
+            self.vertical_active |= vertical_moved;
+        }
+        if terminal {
+            self.horizontal_active = false;
+            self.vertical_active = false;
+        }
+
+        if !horizontal_moved && !vertical_moved && !stop.0 && !stop.1 {
+            return None;
+        }
+
+        Some(smithay::input::pointer::AxisFrame {
+            source: Some(source),
+            time,
+            axis,
+            stop,
+            v120,
+            relative_direction: (
+                AxisRelativeDirection::Identical,
+                AxisRelativeDirection::Identical,
+            ),
+        })
+    }
+}
+
 impl AppState {
     pub fn new(
         display_handle: &DisplayHandle,
         scale_factor: f64,
         loop_signal: std::sync::mpsc::Sender<crate::messages::CompositorMessage>,
+        presentation: crate::presentation::PresentationMode,
         width: u32,
         height: u32,
     ) -> Self {
@@ -152,6 +274,9 @@ impl AppState {
                 smithay::wayland::pointer_constraints::PointerConstraintsState::new::<Self>(
                     display_handle,
                 ),
+            _pointer_gestures_state: smithay::wayland::pointer_gestures::PointerGesturesState::new::<
+                Self,
+            >(display_handle),
             _relative_pointer_state:
                 smithay::wayland::relative_pointer::RelativePointerManagerState::new::<Self>(
                     display_handle,
@@ -169,18 +294,299 @@ impl AppState {
             drag_state: None,
             start_drag_request: None,
             loop_signal,
+            presentation,
             width,
             height,
             scale_factor,
             start_time: std::time::Instant::now(),
             pending_frame_callbacks: Vec::new(),
             needs_redraw: true,
+            rootless_dirty_surfaces: std::collections::HashSet::new(),
             commit_counter: 0,
             host_clipboard_text: None,
             pending_guest_clipboard_mime: None,
             pasteboard_change_count: -1,
             last_pasteboard_poll: std::time::Instant::now() - std::time::Duration::from_millis(100),
+            pointer_gesture: PointerGestureTracker::default(),
+            pointer_axis: PointerAxisTracker::default(),
         }
+    }
+
+    pub fn handle_pointer_axis(
+        &mut self,
+        scale_factor: f64,
+        delta: winit::event::MouseScrollDelta,
+        phase: winit::event::TouchPhase,
+        time: u32,
+    ) {
+        let Some(frame) = self.pointer_axis.frame(scale_factor, delta, phase, time) else {
+            return;
+        };
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    pub fn handle_pinch_gesture(&mut self, delta: f64, phase: winit::event::TouchPhase, time: u32) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+
+        match phase {
+            winit::event::TouchPhase::Started => {
+                self.pointer_gesture.magnify_active = true;
+                if !self.pointer_gesture.protocol_active {
+                    self.pointer_gesture.protocol_active = true;
+                    self.pointer_gesture.scale = 1.0;
+                    self.pointer_gesture.rotation = 0.0;
+                    pointer.gesture_pinch_begin(
+                        self,
+                        &smithay::input::pointer::GesturePinchBeginEvent {
+                            serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                            time,
+                            fingers: 2,
+                        },
+                    );
+                }
+            }
+            winit::event::TouchPhase::Moved => {
+                if !self.pointer_gesture.magnify_active {
+                    self.handle_pinch_gesture(0.0, winit::event::TouchPhase::Started, time);
+                }
+                if delta.is_finite() {
+                    let factor = (1.0 + delta).clamp(0.01, 100.0);
+                    self.pointer_gesture.scale =
+                        (self.pointer_gesture.scale * factor).clamp(0.01, 100.0);
+                    pointer.gesture_pinch_update(
+                        self,
+                        &smithay::input::pointer::GesturePinchUpdateEvent {
+                            time,
+                            delta: (0.0, 0.0).into(),
+                            scale: self.pointer_gesture.scale,
+                            rotation: self.pointer_gesture.rotation,
+                        },
+                    );
+                }
+            }
+            winit::event::TouchPhase::Ended => {
+                self.pointer_gesture.magnify_active = false;
+                self.finish_pointer_gesture_if_idle(&pointer, time, false);
+            }
+            winit::event::TouchPhase::Cancelled => {
+                self.cancel_pointer_gesture(&pointer, time);
+            }
+        }
+    }
+
+    pub fn handle_swipe_gesture(
+        &mut self,
+        delta: (f64, f64),
+        phase: winit::event::TouchPhase,
+        time: u32,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+
+        match phase {
+            winit::event::TouchPhase::Started => {
+                if self.pointer_gesture.swipe_active {
+                    pointer.gesture_swipe_end(
+                        self,
+                        &smithay::input::pointer::GestureSwipeEndEvent {
+                            serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                            time,
+                            cancelled: true,
+                        },
+                    );
+                }
+                self.pointer_gesture.swipe_active = true;
+                pointer.gesture_swipe_begin(
+                    self,
+                    &smithay::input::pointer::GestureSwipeBeginEvent {
+                        serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                        time,
+                        fingers: 3,
+                    },
+                );
+            }
+            winit::event::TouchPhase::Moved => {
+                if !self.pointer_gesture.swipe_active {
+                    self.handle_swipe_gesture((0.0, 0.0), winit::event::TouchPhase::Started, time);
+                }
+                if delta.0.is_finite() && delta.1.is_finite() && (delta.0 != 0.0 || delta.1 != 0.0)
+                {
+                    pointer.gesture_swipe_update(
+                        self,
+                        &smithay::input::pointer::GestureSwipeUpdateEvent {
+                            time,
+                            delta: delta.into(),
+                        },
+                    );
+                }
+            }
+            winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                if self.pointer_gesture.swipe_active {
+                    pointer.gesture_swipe_end(
+                        self,
+                        &smithay::input::pointer::GestureSwipeEndEvent {
+                            serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                            time,
+                            cancelled: phase == winit::event::TouchPhase::Cancelled,
+                        },
+                    );
+                    self.pointer_gesture.swipe_active = false;
+                }
+            }
+        }
+    }
+
+    pub fn handle_rotation_gesture(
+        &mut self,
+        delta: f32,
+        phase: winit::event::TouchPhase,
+        time: u32,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+
+        match phase {
+            winit::event::TouchPhase::Started => {
+                self.pointer_gesture.rotation_active = true;
+                if !self.pointer_gesture.protocol_active {
+                    self.pointer_gesture.protocol_active = true;
+                    self.pointer_gesture.scale = 1.0;
+                    self.pointer_gesture.rotation = 0.0;
+                    pointer.gesture_pinch_begin(
+                        self,
+                        &smithay::input::pointer::GesturePinchBeginEvent {
+                            serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                            time,
+                            fingers: 2,
+                        },
+                    );
+                }
+            }
+            winit::event::TouchPhase::Moved => {
+                if !self.pointer_gesture.rotation_active {
+                    self.handle_rotation_gesture(0.0, winit::event::TouchPhase::Started, time);
+                }
+                if delta.is_finite() {
+                    // Winit reports per-event counterclockwise deltas, while Wayland
+                    // expects a clockwise rotation relative to the gesture start.
+                    self.pointer_gesture.rotation -= f64::from(delta);
+                    pointer.gesture_pinch_update(
+                        self,
+                        &smithay::input::pointer::GesturePinchUpdateEvent {
+                            time,
+                            delta: (0.0, 0.0).into(),
+                            scale: self.pointer_gesture.scale,
+                            rotation: self.pointer_gesture.rotation,
+                        },
+                    );
+                }
+            }
+            winit::event::TouchPhase::Ended => {
+                self.pointer_gesture.rotation_active = false;
+                self.finish_pointer_gesture_if_idle(&pointer, time, false);
+            }
+            winit::event::TouchPhase::Cancelled => {
+                self.cancel_pointer_gesture(&pointer, time);
+            }
+        }
+    }
+
+    fn finish_pointer_gesture_if_idle(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        time: u32,
+        cancelled: bool,
+    ) {
+        if self.pointer_gesture.protocol_active
+            && !self.pointer_gesture.magnify_active
+            && !self.pointer_gesture.rotation_active
+        {
+            pointer.gesture_pinch_end(
+                self,
+                &smithay::input::pointer::GesturePinchEndEvent {
+                    serial: smithay::utils::SERIAL_COUNTER.next_serial(),
+                    time,
+                    cancelled,
+                },
+            );
+            self.pointer_gesture.protocol_active = false;
+            self.pointer_gesture.scale = 1.0;
+            self.pointer_gesture.rotation = 0.0;
+        }
+    }
+
+    fn cancel_pointer_gesture(
+        &mut self,
+        pointer: &smithay::input::pointer::PointerHandle<Self>,
+        time: u32,
+    ) {
+        self.pointer_gesture.magnify_active = false;
+        self.pointer_gesture.rotation_active = false;
+        self.finish_pointer_gesture_if_idle(pointer, time, true);
+    }
+
+    fn root_toplevel_id_for_surface(
+        &self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<smithay::reexports::wayland_server::backend::ObjectId> {
+        let mut root = surface.clone();
+        loop {
+            while let Some(parent) = smithay::wayland::compositor::get_parent(&root) {
+                root = parent;
+            }
+            let Some(parent) = self
+                .popups
+                .iter()
+                .find(|popup| popup.wl_surface() == &root)
+                .and_then(|popup| popup.get_parent_surface())
+            else {
+                break;
+            };
+            root = parent;
+        }
+        self.toplevels
+            .iter()
+            .find(|toplevel| toplevel.wl_surface() == &root)
+            .map(|toplevel| toplevel.wl_surface().id())
+    }
+
+    pub fn take_frame_callbacks_for(
+        &mut self,
+        root_surface: Option<&smithay::reexports::wayland_server::backend::ObjectId>,
+    ) -> Vec<smithay::reexports::wayland_server::protocol::wl_callback::WlCallback> {
+        if root_surface.is_none() {
+            return std::mem::take(&mut self.pending_frame_callbacks)
+                .into_iter()
+                .map(|pending| pending.callback)
+                .collect();
+        }
+
+        let mut selected = Vec::new();
+        let mut remaining = Vec::new();
+        for pending in std::mem::take(&mut self.pending_frame_callbacks) {
+            let resolved_root = pending.root_surface.clone().or_else(|| {
+                pending
+                    .source_surface
+                    .is_alive()
+                    .then(|| self.root_toplevel_id_for_surface(&pending.source_surface))
+                    .flatten()
+            });
+            if resolved_root.as_ref() == root_surface {
+                selected.push(pending.callback);
+            } else {
+                remaining.push(pending);
+            }
+        }
+        self.pending_frame_callbacks = remaining;
+        selected
     }
 
     pub fn poll_host_clipboard(&mut self) {
@@ -328,29 +734,57 @@ impl CompositorHandler for AppState {
         use smithay::wayland::compositor::{
             SurfaceAttributes, TraversalAction, with_surface_tree_downward,
         };
+        // Resolve the owner before walking the tree. Smithay holds its surface-tree
+        // mutex during traversal, so calling get_parent from the visitor deadlocks.
+        let root_surface = self.root_toplevel_id_for_surface(surface);
         let mut new_cbs = Vec::new();
         with_surface_tree_downward(
             surface,
             (),
             |_, _, _| TraversalAction::DoChildren(()),
-            |_surf, states, _| {
+            |callback_surface, states, _| {
                 let mut guard = states.cached_state.get::<SurfaceAttributes>();
-                new_cbs.extend(guard.current().frame_callbacks.drain(..));
+                new_cbs.extend(guard.current().frame_callbacks.drain(..).map(|callback| {
+                    PendingFrameCallback {
+                        root_surface: root_surface.clone(),
+                        source_surface: callback_surface.clone(),
+                        callback,
+                    }
+                }));
             },
             |_, _, _| true,
         );
         self.pending_frame_callbacks.extend(new_cbs);
         self.commit_counter = self.commit_counter.saturating_add(1);
-        self.needs_redraw = true;
+        if self.presentation.is_rootless() {
+            if let Some(root_surface) = root_surface {
+                self.rootless_dirty_surfaces.insert(root_surface);
+                self.needs_redraw = true;
+            }
+        } else {
+            self.needs_redraw = true;
+        }
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
         let surface_id = surface.id();
+        let was_toplevel = self
+            .toplevels
+            .iter()
+            .any(|toplevel| toplevel.wl_surface() == surface);
         self.layout.remove_tile(&surface_id);
         self.toplevels
             .retain(|toplevel| toplevel.wl_surface() != surface);
         self.popups.retain(|popup| popup.wl_surface() != surface);
         self.surface_positions.remove(&surface_id);
+        self.pending_frame_callbacks
+            .retain(|pending| pending.source_surface != *surface);
+        if was_toplevel {
+            self.output.leave(surface);
+            self.rootless_dirty_surfaces.remove(&surface_id);
+            self.pending_frame_callbacks
+                .retain(|pending| pending.root_surface.as_ref() != Some(&surface_id));
+        }
         if self
             .drag_state
             .as_ref()
@@ -368,6 +802,16 @@ impl CompositorHandler for AppState {
             }
         }
         self.needs_redraw = true;
+        if self.presentation.is_rootless() {
+            let _ = self.loop_signal.send(
+                crate::messages::CompositorMessage::RootlessSurfaceDestroyed(surface_id.clone()),
+            );
+        }
+        if was_toplevel && self.presentation.is_rootless() {
+            let _ = self.loop_signal.send(
+                crate::messages::CompositorMessage::RootlessToplevelDestroyed(surface_id.clone()),
+            );
+        }
         log::info!("Removed destroyed surface {surface_id:?} from the compositor layout");
     }
 }
@@ -379,13 +823,27 @@ impl XdgShellHandler for AppState {
         log::info!("New XDG Toplevel Created: {:?}", surface.wl_surface().id());
         if !self.toplevels.contains(&surface) {
             self.toplevels.push(surface.clone());
-            self.layout.add_tile(surface.clone());
+            self.output.enter(surface.wl_surface());
+            if self.presentation.is_rootless() {
+                self.rootless_dirty_surfaces
+                    .insert(surface.wl_surface().id());
+                let _ = self.loop_signal.send(
+                    crate::messages::CompositorMessage::RootlessToplevelCreated(
+                        surface.wl_surface().id(),
+                    ),
+                );
+            } else {
+                self.layout.add_tile(surface.clone());
+            }
             self.needs_redraw = true;
         }
         // Tell the client the compositor window size and scale so it renders at
         // the correct HiDPI resolution.
-        let (logical_w, logical_h) =
-            crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
+        let (logical_w, logical_h) = if self.presentation.is_rootless() {
+            (960, 720)
+        } else {
+            crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor)
+        };
         surface.with_pending_state(|state| {
             state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
             state.size = Some((logical_w, logical_h).into());
@@ -423,20 +881,30 @@ impl XdgShellHandler for AppState {
     }
     fn reposition_request(
         &mut self,
-        _surface: smithay::wayland::shell::xdg::PopupSurface,
-        _positioner: smithay::wayland::shell::xdg::PositionerState,
-        _token: u32,
+        surface: smithay::wayland::shell::xdg::PopupSurface,
+        positioner: smithay::wayland::shell::xdg::PositionerState,
+        token: u32,
     ) {
+        let geometry = positioner.get_geometry();
+        surface.with_pending_state(|state| state.geometry = geometry);
+        surface.send_repositioned(token);
+        self.needs_redraw = true;
     }
     fn maximize_request(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
-        println!("*** HIT MAXIMIZE REQUEST ***");
         log::info!("Maximize Request: {:?}", surface.wl_surface().id());
-        log::info!(
-            "DEBUG MAXIMIZE: self.width={}, self.height={}, self.scale_factor={}",
-            self.width,
-            self.height,
-            self.scale_factor
-        );
+        if self.presentation.is_rootless() {
+            surface.with_pending_state(|state| {
+                state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            });
+            surface.send_configure();
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessMaximize {
+                    surface: surface.wl_surface().id(),
+                    maximized: true,
+                });
+            return;
+        }
         let (logical_w, logical_h) =
             crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
         log::info!(
@@ -462,6 +930,15 @@ impl XdgShellHandler for AppState {
              state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
          });
         surface.send_configure();
+        if self.presentation.is_rootless() {
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessMaximize {
+                    surface: surface.wl_surface().id(),
+                    maximized: false,
+                });
+            return;
+        }
         let _ = self
             .loop_signal
             .send(crate::messages::CompositorMessage::Maximize(false));
@@ -472,6 +949,19 @@ impl XdgShellHandler for AppState {
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
         log::info!("Fullscreen Request: {:?}", surface.wl_surface().id());
+        if self.presentation.is_rootless() {
+            surface.with_pending_state(|state| {
+                state.states.set(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+            });
+            surface.send_configure();
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessFullscreen {
+                    surface: surface.wl_surface().id(),
+                    fullscreen: true,
+                });
+            return;
+        }
         let (logical_w, logical_h) =
             crate::layout::logical_size_from_physical(self.width, self.height, self.scale_factor);
         log::info!("Fullscreening to Logical Size: {}x{}", logical_w, logical_h);
@@ -490,6 +980,15 @@ impl XdgShellHandler for AppState {
              state.states.unset(smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
         });
         surface.send_configure();
+        if self.presentation.is_rootless() {
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessFullscreen {
+                    surface: surface.wl_surface().id(),
+                    fullscreen: false,
+                });
+            return;
+        }
         let _ = self
             .loop_signal
             .send(crate::messages::CompositorMessage::Fullscreen(false));
@@ -505,7 +1004,37 @@ impl XdgShellHandler for AppState {
             surface.wl_surface().id()
         );
         let id = surface.wl_surface().id();
-        self.start_drag_request = Some(id);
+        if self.presentation.is_rootless() {
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessBeginMove(id));
+        } else {
+            self.start_drag_request = Some(id);
+        }
+    }
+
+    fn minimize_request(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
+        if self.presentation.is_rootless() {
+            let _ = self
+                .loop_signal
+                .send(crate::messages::CompositorMessage::RootlessMinimize(
+                    surface.wl_surface().id(),
+                ));
+        }
+    }
+
+    fn title_changed(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
+        if self.presentation.is_rootless() {
+            let _ = self.loop_signal.send(
+                crate::messages::CompositorMessage::RootlessToplevelTitleChanged(
+                    surface.wl_surface().id(),
+                ),
+            );
+        }
+    }
+
+    fn app_id_changed(&mut self, surface: smithay::wayland::shell::xdg::ToplevelSurface) {
+        self.title_changed(surface);
     }
 }
 impl ShmHandler for AppState {
@@ -672,6 +1201,11 @@ impl XdgDecorationHandler for AppState {
         log::info!("New decoration requested - using server-side");
     }
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: DecorationMode) {
+        let mode = if self.presentation.is_rootless() {
+            DecorationMode::ServerSide
+        } else {
+            mode
+        };
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(mode);
         });
@@ -717,6 +1251,7 @@ impl smithay::wayland::pointer_constraints::PointerConstraintsHandler for AppSta
     }
 }
 smithay::delegate_pointer_constraints!(AppState);
+smithay::delegate_pointer_gestures!(AppState);
 smithay::delegate_relative_pointer!(AppState);
 
 fn nix_pipe() -> Option<(std::os::unix::io::OwnedFd, std::os::unix::io::OwnedFd)> {
@@ -775,6 +1310,85 @@ fn preferred_clipboard_text_mime(mime_types: &[String]) -> Option<String> {
                 .find(|mime| is_clipboard_text_mime(mime))
                 .cloned()
         })
+}
+
+#[cfg(test)]
+mod pointer_axis_tests {
+    use super::PointerAxisTracker;
+    use smithay::backend::input::AxisSource;
+    use winit::{
+        dpi::PhysicalPosition,
+        event::{MouseScrollDelta, TouchPhase},
+    };
+
+    #[test]
+    fn preserves_both_axes_for_trackpad_scrolls() {
+        let mut tracker = PointerAxisTracker::default();
+        let frame = tracker
+            .frame(
+                2.0,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(12.0, -8.0)),
+                TouchPhase::Started,
+                10,
+            )
+            .expect("non-zero trackpad movement should produce a frame");
+
+        assert_eq!(frame.source, Some(AxisSource::Finger));
+        assert_eq!(frame.axis, (-6.0, 4.0));
+        assert_eq!(frame.stop, (false, false));
+        assert_eq!(frame.v120, None);
+    }
+
+    #[test]
+    fn zero_delta_end_stops_every_active_trackpad_axis() {
+        let mut tracker = PointerAxisTracker::default();
+        tracker.frame(
+            1.0,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(3.0, 5.0)),
+            TouchPhase::Started,
+            10,
+        );
+        let end = tracker
+            .frame(
+                1.0,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                TouchPhase::Ended,
+                11,
+            )
+            .expect("the terminal frame must carry axis_stop");
+
+        assert_eq!(end.axis, (0.0, 0.0));
+        assert_eq!(end.stop, (true, true));
+        assert!(
+            tracker
+                .frame(
+                    1.0,
+                    MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+                    TouchPhase::Ended,
+                    12,
+                )
+                .is_none(),
+            "a completed gesture must not leak active axes"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_keeps_v120_and_does_not_emit_finger_stops() {
+        let mut tracker = PointerAxisTracker::default();
+        let frame = tracker
+            .frame(
+                1.0,
+                MouseScrollDelta::LineDelta(1.0, -2.0),
+                TouchPhase::Moved,
+                10,
+            )
+            .expect("wheel movement should produce a frame");
+
+        assert_eq!(frame.source, Some(AxisSource::Wheel));
+        assert_eq!(frame.axis, (-10.0, 20.0));
+        assert_eq!(frame.v120, Some((-120, 240)));
+        assert_eq!(frame.stop, (false, false));
+    }
 }
 
 #[cfg(test)]
